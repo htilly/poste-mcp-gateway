@@ -11,6 +11,23 @@ import type { MailWriter } from './mail-write.js';
 import type { MailSender } from './smtp.js';
 import { ALL_SCOPES, SCOPES, isScope, type Scope } from './scopes.js';
 import { silentAudit, type Audit } from './audit.js';
+import { LOGIN_PAGE_CSP, renderAddMailboxPage } from './login-page.js';
+import type { Response } from 'express';
+
+function sendPage(res: Response, status: number, html: string): void {
+  res
+    .status(status)
+    .set({
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': LOGIN_PAGE_CSP,
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+    })
+    .send(html);
+}
+
+const LINK_EXPIRED = 'This link has expired or was already used. Ask Claude for a new one (add_mailbox).';
 
 export interface AppDeps {
   provider: GatewayProvider;
@@ -95,6 +112,38 @@ export function createApp({
     }
   });
 
+  // add_mailbox links: attach one more proven mailbox to an existing connection.
+  app.get('/add-mailbox', (req, res) => {
+    const token = String(req.query.t ?? '');
+    const view = provider.addLinkView(token);
+    if (!view) {
+      res.status(400).type('text/plain').send(LINK_EXPIRED);
+      return;
+    }
+    sendPage(res, 200, renderAddMailboxPage({ token, accounts: view.accounts }));
+  });
+
+  app.post('/add-mailbox', loginLimiter, express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
+    const token = String(req.body?.t ?? '');
+    const user = String(req.body?.user ?? '');
+    const outcome = await provider.completeAddMailbox(token, user, String(req.body?.password ?? ''), req.ip ?? 'unknown');
+    switch (outcome.kind) {
+      case 'added':
+        sendPage(res, 200, renderAddMailboxPage({ token: '', accounts: outcome.accounts, added: outcome.account }));
+        return;
+      case 'retry': {
+        audit('add_mailbox_refused', { user: user.trim().toLowerCase().slice(0, 254), ip: req.ip, status: outcome.status });
+        const view = provider.addLinkView(token);
+        if (!view) break;
+        sendPage(res, outcome.status, renderAddMailboxPage({ token, accounts: view.accounts, message: outcome.message }));
+        return;
+      }
+      case 'expired':
+        break;
+    }
+    res.status(400).type('text/plain').send(LINK_EXPIRED);
+  });
+
   const bearer = requireBearerAuth({
     verifier: provider,
     requiredScopes: [SCOPES.read],
@@ -113,6 +162,8 @@ export function createApp({
       scopes: (req.auth?.scopes ?? []).filter(isScope),
       credentialsFor: (auth, account) => provider.credentialsFor(auth, account),
       accountsFor: auth => provider.accountsFor(auth),
+      createAddMailboxLink: auth => provider.createAddMailboxLink(auth),
+      removeMailbox: (auth, address) => provider.removeMailbox(auth, address),
       canSend: user => provider.canSend(user),
       revokeGrant: id => provider.revokeGrant(id),
     });

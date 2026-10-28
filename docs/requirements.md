@@ -23,14 +23,17 @@ judgment.
   mailboxes signed in to when it was created, each proven by its own IMAP
   login and on the allowlist. Nothing in a request can select a mailbox
   outside that set. A person may connect several of their own mailboxes;
-  one failed mailbox fails the whole sign-in.
+  one failed mailbox fails the whole sign-in. More can be added later
+  through a single-use link where the mailbox's password is entered on the
+  gateway's page, never in the conversation.
 - **R4. Revocation.** A user (or the admin) can revoke access; revoking deletes
   the stored credential. A changed poste.io password invalidates access, and
   the user must sign in again. Grants end after a maximum age, and a replayed
   refresh token revokes its grant.
-- **R5. Only Claude as client.** OAuth clients may only redirect to the
-  configured Claude hosts or loopback, so the genuine sign-in page cannot be
-  used to hand an authorization code to anyone else.
+- **R5. Only known assistants as clients.** OAuth clients may only redirect
+  to configured hosts (Claude by default, ChatGPT when enabled) or loopback,
+  so the genuine sign-in page cannot be used to hand an authorization code to
+  anyone else.
 
 ## What Claude can do
 

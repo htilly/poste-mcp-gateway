@@ -234,7 +234,7 @@ describe('OAuth + MCP flow', () => {
     const list = await mcp(alice.access_token, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
     expect(list.res.status).toBe(200);
     expect(list.message.result.tools.map((t: { name: string }) => t.name).sort()).toEqual(
-      ['list_accounts', 'list_folders', 'read_attachment', 'read_message', 'read_thread', 'search_mail'],
+      ['add_mailbox', 'list_accounts', 'list_folders', 'read_attachment', 'read_message', 'read_thread', 'remove_mailbox', 'search_mail'],
     );
 
     const a = await callSearch(alice.access_token);
@@ -470,6 +470,75 @@ describe('OAuth + MCP flow', () => {
     expect(sent).toEqual([]);
     expect((await send('alice@example.com')).message.result.isError).toBeFalsy();
     expect(sent.map(s => s.creds.user)).toEqual(['alice@example.com']);
+  });
+
+  describe('adding mailboxes through a one-time link', () => {
+    const tool = (accessToken: string, name: string, args: Record<string, unknown> = {}) =>
+      mcp(accessToken, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name, arguments: args } });
+    const linkFor = async (accessToken: string) => {
+      const res = await tool(accessToken, 'add_mailbox');
+      const url = new URL(JSON.parse(res.message.result.content[0].text).url);
+      expect(url.pathname).toBe('/add-mailbox');
+      return url.searchParams.get('t')!;
+    };
+    const submit = (t: string, user: string, password: string) =>
+      fetch(`${base}/add-mailbox`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ t, user, password }).toString(),
+      });
+    const accounts = async (accessToken: string) =>
+      JSON.parse((await tool(accessToken, 'list_accounts')).message.result.content[0].text).accounts.map((a: { address: string }) => a.address);
+
+    it('adds a proven mailbox without reconnecting, and the link works once', async () => {
+      const alice = await signIn('alice@example.com');
+      const t = await linkFor(alice.access_token!);
+
+      const page = await fetch(`${base}/add-mailbox?t=${encodeURIComponent(t)}`);
+      expect(page.status).toBe(200);
+      expect(page.headers.get('content-security-policy')).toContain("default-src 'none'");
+      expect(await page.text()).toContain('alice@example.com');
+
+      expect((await submit(t, 'alice.work@example.com', 'wrong')).status).toBe(401);
+      const ok = await submit(t, 'alice.work@example.com', 'work-pw');
+      expect(ok.status).toBe(200);
+      expect(await ok.text()).toContain('Mailbox added');
+      expect(await accounts(alice.access_token!)).toEqual(['alice@example.com', 'alice.work@example.com']);
+
+      // Same token again: consumed.
+      expect((await submit(t, 'bob@example.com', 'bob-pw')).status).toBe(400);
+      // The new mailbox is usable right away, on the existing token.
+      await callSearch(alice.access_token!, 'alice.work@example.com');
+      expect(readerCalls.at(-1)?.user).toBe('alice.work@example.com');
+    });
+
+    it('refuses unknown or forged links and addresses not on the allowlist', async () => {
+      expect((await fetch(`${base}/add-mailbox?t=forged`)).status).toBe(400);
+      const alice = await signIn('alice@example.com');
+      const t = await linkFor(alice.access_token!);
+      loginCalls = [];
+      expect((await submit(t, 'stranger@example.com', 'x')).status).toBe(401);
+      expect(loginCalls).toEqual([]);
+    });
+
+    it('removes added mailboxes but never the primary', async () => {
+      const alice = await signIn('alice@example.com', [], ['alice.work@example.com']);
+      const primary = await tool(alice.access_token!, 'remove_mailbox', { address: 'alice@example.com' });
+      expect(primary.message.result.isError).toBe(true);
+      const removed = await tool(alice.access_token!, 'remove_mailbox', { address: 'Alice.Work@example.com' });
+      expect(JSON.parse(removed.message.result.content[0].text).accounts).toEqual(['alice@example.com']);
+      expect((await callSearch(alice.access_token!, 'alice.work@example.com')).message.result.isError).toBe(true);
+    });
+  });
+
+  it('accepts the server origin as resource indicator (ChatGPT style)', async () => {
+    const clientId = await register();
+    const url = new URL('/authorize', base);
+    url.search = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: REDIRECT,
+      code_challenge: 'x'.repeat(43), code_challenge_method: 'S256', resource: base,
+    }).toString();
+    expect((await fetch(url, { redirect: 'manual' })).status).toBe(200);
   });
 
   it('refuses a wrong password with the same message', async () => {

@@ -26,8 +26,10 @@ const PENDING_TTL_MS = 10 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
 /** How long a finished sign-in answers a duplicate submit with the same redirect. */
 const REPLAY_TTL_MS = 60 * 1000;
-/** Mailboxes one sign-in can connect: the primary plus extras. Matches the rows on the sign-in page. */
-export const MAX_ACCOUNTS_PER_GRANT = 3;
+/** Mailboxes one connection can hold. The sign-in page offers three rows; add_mailbox links can add the rest. */
+export const MAX_ACCOUNTS_PER_GRANT = 5;
+/** How long an add_mailbox link stays valid. */
+const ADD_LINK_TTL_MS = 10 * 60 * 1000;
 
 export interface Login {
   user: string;
@@ -55,6 +57,22 @@ interface AuthCode {
   params: AuthorizationParams;
   expiresAt: number;
 }
+
+/**
+ * A one-time link that adds a mailbox to an existing connection. The link
+ * only identifies the connection; the mailbox still has to be proven by its
+ * own password, entered on the gateway's page, never in the chat.
+ */
+interface AddLink {
+  grantId: string;
+  expiresAt: number;
+  busy?: boolean;
+}
+
+export type AddMailboxOutcome =
+  | { kind: 'added'; account: string; accounts: string[] }
+  | { kind: 'retry'; status: number; message: string }
+  | { kind: 'expired' };
 
 /** A sign-in that already succeeded, kept briefly so a double submit is harmless. */
 interface CompletedSignIn {
@@ -123,6 +141,7 @@ export class GatewayProvider implements OAuthServerProvider {
   private readonly pending = new Map<string, PendingAuthorization>();
   private readonly codes = new Map<string, AuthCode>();
   private readonly completed = new Map<string, CompletedSignIn>();
+  private readonly addLinks = new Map<string, AddLink>();
   private readonly access = new Map<string, AccessEntry>();
   private readonly now: () => number;
   private readonly audit: Audit;
@@ -160,13 +179,24 @@ export class GatewayProvider implements OAuthServerProvider {
     return grant.scopes.filter(s => s !== SCOPES.send || anyCanSend) as Scope[];
   }
 
+  /**
+   * RFC 8707 resource indicators naming this server. Claude sends the MCP
+   * endpoint URL; ChatGPT may send the server's origin. Anything else names
+   * a different server and is refused.
+   */
+  private isOurResource(resource: URL): boolean {
+    const ours = this.opts.resourceUrl;
+    const href = resource.href.replace(/\/$/, '');
+    return href === ours.href.replace(/\/$/, '') || href === ours.origin;
+  }
+
   /** Whether this mailbox may send right now. Send tools check it per call. */
   canSend(user: string): boolean {
     return this.opts.canSend(LoginGuard.normalize(user));
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
-    if (params.resource && params.resource.href !== this.opts.resourceUrl.href) {
+    if (params.resource && !this.isOurResource(params.resource)) {
       const url = new URL(params.redirectUri);
       url.searchParams.set('error', new InvalidTargetError('').errorCode);
       url.searchParams.set('error_description', 'unknown resource');
@@ -310,7 +340,7 @@ export class GatewayProvider implements OAuthServerProvider {
       throw new InvalidGrantError('redirect_uri does not match the authorization request');
     }
     const grantResource = entry.params.resource?.href;
-    if (resource && resource.href !== (grantResource ?? this.opts.resourceUrl.href)) {
+    if (resource && !this.isOurResource(resource)) {
       throw new InvalidTargetError('resource does not match the authorization request');
     }
 
@@ -362,7 +392,7 @@ export class GatewayProvider implements OAuthServerProvider {
     if (!grant || grant.clientId !== client.client_id || grant.refreshExpiresAt <= this.now()) {
       throw new InvalidGrantError('invalid or expired refresh token');
     }
-    if (resource && resource.href !== (grant.resource ?? this.opts.resourceUrl.href)) {
+    if (resource && !this.isOurResource(resource)) {
       throw new InvalidTargetError('resource does not match the grant');
     }
     // Rotate: the presented refresh token is dead from here on.
@@ -466,8 +496,98 @@ export class GatewayProvider implements OAuthServerProvider {
     return grant;
   }
 
+  /** Issues a single-use link for adding a mailbox to the request's connection. */
+  createAddMailboxLink(auth: AuthInfo | undefined): { url: string; expiresAt: string } {
+    const grant = this.grantFor(auth);
+    if (grant.accounts.length >= MAX_ACCOUNTS_PER_GRANT) {
+      throw new Error(`this connection already has the maximum of ${MAX_ACCOUNTS_PER_GRANT} mailboxes`);
+    }
+    this.sweep();
+    const token = newToken();
+    const expiresAt = this.now() + ADD_LINK_TTL_MS;
+    this.addLinks.set(hashToken(token), { grantId: grant.id, expiresAt });
+    this.audit('add_link_created', { user: grant.user, grantId: grant.id });
+    const url = new URL('/add-mailbox', this.opts.resourceUrl);
+    url.searchParams.set('t', token);
+    return { url: url.href, expiresAt: new Date(expiresAt).toISOString() };
+  }
+
+  private liveAddLink(token: string): { link: AddLink; grant: Grant } | undefined {
+    const link = this.addLinks.get(hashToken(token));
+    const grant = link && this.opts.store.getGrant(link.grantId);
+    if (!link || !grant || link.expiresAt <= this.now()) {
+      this.addLinks.delete(hashToken(token));
+      return undefined;
+    }
+    return { link, grant };
+  }
+
+  /** What the add-mailbox page shows: the connection the link belongs to. */
+  addLinkView(token: string): { primary: string; accounts: string[] } | undefined {
+    const live = this.liveAddLink(token);
+    return live && { primary: live.grant.user, accounts: live.grant.accounts.map(a => a.user) };
+  }
+
+  /**
+   * Adds a mailbox through a link: same allowlist, guard and IMAP proof as
+   * sign-in. The link is consumed only on success, so a typo can be retried
+   * within its lifetime; one attempt runs at a time.
+   */
+  async completeAddMailbox(token: string, rawUser: string, password: string, ip: string): Promise<AddMailboxOutcome> {
+    const live = this.liveAddLink(token);
+    if (!live) return { kind: 'expired' };
+    const { link, grant } = live;
+    const user = LoginGuard.normalize(rawUser);
+    if (grant.accounts.some(a => a.user === user)) {
+      return { kind: 'retry', status: 409, message: `${user} is already part of this connection.` };
+    }
+    if (grant.accounts.length >= MAX_ACCOUNTS_PER_GRANT) {
+      return { kind: 'retry', status: 409, message: `This connection already has the maximum of ${MAX_ACCOUNTS_PER_GRANT} mailboxes.` };
+    }
+    if (!user || !password || link.busy) return { kind: 'retry', status: 401, message: SIGN_IN_FAILED };
+    if (!this.opts.guard.check(user, ip).ok) return { kind: 'retry', status: 401, message: SIGN_IN_FAILED };
+
+    link.busy = true;
+    let result: LoginResult = 'unavailable';
+    try {
+      result = await this.opts.verifyLogin({ user, password });
+    } finally {
+      link.busy = false;
+      if (result === 'unavailable') this.opts.guard.release(user, ip);
+      else this.opts.guard.record(user, ip, result === 'ok');
+    }
+    if (result === 'unavailable') return { kind: 'retry', status: 503, message: 'The mail server could not be reached. Try again shortly.' };
+    if (result !== 'ok') return { kind: 'retry', status: 401, message: SIGN_IN_FAILED };
+
+    // Re-read: the grant may have changed while the IMAP check ran.
+    const current = this.opts.store.getGrant(grant.id);
+    if (!current) return { kind: 'expired' };
+    if (!current.accounts.some(a => a.user === user)) {
+      current.accounts.push({ user, sealedPassword: this.opts.vault.seal(password, passwordAad(user)) });
+      this.opts.store.putGrant(current);
+    }
+    this.addLinks.delete(hashToken(token));
+    this.audit('mailbox_added', { user: current.user, added: user, grantId: current.id, ip });
+    return { kind: 'added', account: user, accounts: current.accounts.map(a => a.user) };
+  }
+
+  /** Removes a mailbox from the request's connection. The primary mailbox cannot be removed. */
+  removeMailbox(auth: AuthInfo | undefined, address: string): string[] {
+    const grant = this.grantFor(auth);
+    const user = LoginGuard.normalize(address);
+    if (user === grant.user) {
+      throw new Error(`${user} is the primary mailbox of this connection; disconnect the connector in Claude to remove it`);
+    }
+    if (!grant.accounts.some(a => a.user === user)) throw new Error(`${user} is not part of this connection`);
+    grant.accounts = grant.accounts.filter(a => a.user !== user);
+    this.opts.store.putGrant(grant);
+    this.audit('mailbox_removed', { user: grant.user, removed: user, grantId: grant.id });
+    return grant.accounts.map(a => a.user);
+  }
+
   private sweep(): void {
     const now = this.now();
+    for (const [k, v] of this.addLinks) if (v.expiresAt <= now) this.addLinks.delete(k);
     for (const [k, v] of this.pending) if (v.expiresAt <= now) this.pending.delete(k);
     for (const [k, v] of this.codes) if (v.expiresAt <= now) this.codes.delete(k);
     for (const [k, v] of this.completed) if (v.expiresAt <= now) this.completed.delete(k);

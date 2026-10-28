@@ -3,8 +3,8 @@
 An MCP gateway into poste.io mailboxes. A small, invited group of mailbox
 owners add `https://mail.example.com/mcp` as a custom connector in Claude,
 sign in once with their own poste.io address and password, and Claude can
-then work with **their** mailboxes (up to three of their own in one
-connection). Reading is always allowed; organizing
+then work with **their** mailboxes (up to five of their own in one
+connection). It also works as a ChatGPT connector. Reading is always allowed; organizing
 (flags, moves, Trash, drafts) and sending are separate permissions each
 user ticks at sign-in, and sending must also be enabled per address by the
 administrator.
@@ -27,8 +27,10 @@ Claude ──HTTPS :443──▶ reverse proxy ──▶ gateway :8080 ──IMA
   `SEND_USERS`). Tools for scopes a grant lacks are never registered, and
   scopes are re-checked against current configuration on every request.
 - **Several of your own mailboxes per connection.** The sign-in page takes
-  the primary mailbox plus up to two more. Each one must be on the allowlist
-  and is proven by logging in to it; if any fails, the whole sign-in fails.
+  the primary mailbox plus up to two more, and `add_mailbox` adds more later
+  without reconnecting (up to five). Each one must be on the allowlist and is
+  proven by logging in to it; at sign-in, if any fails, the whole sign-in
+  fails.
   Every tool takes an optional `account` (default: the primary); a mailbox
   outside the grant is unreachable.
 - **One grant per sign-in and client.** Each mailbox's IMAP password is
@@ -51,6 +53,8 @@ supplies the provider (`src/provider.ts`).
 | Tool | Scope | Does |
 |---|---|---|
 | `list_accounts` | read | The mailboxes in this connection, which is the default, and which may send |
+| `add_mailbox` | any | A one-time link (10 minutes) where the user signs in to another mailbox to add it |
+| `remove_mailbox` | any | Remove an added mailbox (not the primary) and delete its stored password |
 | `list_folders` | read | Folders with message and unread counts |
 | `search_mail` | read | IMAP SEARCH in one folder (text, from, to, subject, since, before, unseen), newest first, max 50 |
 | `read_message` | read | Headers, body as text/Markdown (20k chars max), attachment list |
@@ -62,7 +66,7 @@ supplies the provider (`src/provider.ts`).
 | `save_draft` | modify | New message, reply, reply-all or forward, saved to Drafts |
 | `send_message`, `reply_to_message`, `forward_message` | send | Send as the signed-in address via poste.io SMTP, copy kept in Sent |
 
-All tools except `list_accounts` take an optional `account` (an address
+All tools except `list_accounts`, `add_mailbox` and `remove_mailbox` take an optional `account` (an address
 from `list_accounts`). Send permission is checked per mailbox.
 
 Everything a message's sender wrote (subjects, addresses, filenames, bodies,
@@ -89,11 +93,17 @@ puts the limits in the server:
   and SMTP only in `smtp.ts`; `test/readonly.test.ts` fails the build
   otherwise, and enforces that read-only grants never see a write tool.
   There is no expunge and no folder deletion or rename.
-- **Only Claude can be a client.** Dynamic client registration accepts
-  redirect URIs only for `ALLOWED_REDIRECT_HOSTS` (claude.ai, claude.com)
-  or loopback, so nobody can register a look-alike client that collects
-  authorization codes through the genuine sign-in page. The page still
-  shows the full redirect URI.
+- **Only known assistants can be clients.** Dynamic client registration
+  accepts redirect URIs only for `ALLOWED_REDIRECT_HOSTS` (claude.ai and
+  claude.com by default; add chatgpt.com for ChatGPT) or loopback, so nobody
+  can register a look-alike client that collects authorization codes
+  through the genuine sign-in page. The page still shows the full redirect
+  URI.
+- **Adding mailboxes later never puts a password in the chat.**
+  `add_mailbox` returns a single-use link bound to the connection; the
+  password is entered on the gateway's own page. A link without the
+  mailbox's password adds nothing, so a prompt-injected request for one is
+  harmless.
 - **Bounded failed logins, also under parallel requests.** All IMAP logins
   come from one IP. Unknown addresses are refused before any IMAP traffic.
   Each attempt is reserved before the IMAP call, an account has at most one
@@ -139,7 +149,7 @@ puts the limits in the server:
 | `SEND_USERS` | empty | Addresses that may be granted `mail.send`. Must be a subset of `ALLOWED_USERS`. Empty: nobody can send. |
 | `SEND_NEW_RECIPIENTS` | `draft` | `draft`: mail to never-before-mailed recipients is saved to Drafts instead. `allow`: send anyway. |
 | `SEND_LIMIT_PER_HOUR` | `10` | Messages per user per hour. |
-| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | https hosts OAuth clients may redirect to (subdomains included). Loopback http is always allowed. |
+| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | https hosts OAuth clients may redirect to (subdomains included). Add `chatgpt.com` to allow ChatGPT. Loopback http is always allowed. |
 | `MAX_GRANT_AGE_DAYS` | `90` | Absolute grant lifetime; refreshing never extends past it. |
 | `IMAP_HOST` | required | poste.io IMAP host. |
 | `IMAP_PORT` | `993` | IMAPS port. |
@@ -149,6 +159,43 @@ puts the limits in the server:
 | `STATE_FILE` | `/state/gateway.json` | Clients and grants. |
 | `LISTEN_HOST` / `LISTEN_PORT` | `0.0.0.0` / `8080` | Inside the container; publish it on loopback only. |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | `3600` / `2592000` | Seconds. |
+
+## Connecting
+
+### Claude
+
+Settings → Connectors → **Add custom connector** → URL `https://<host>/mcp`.
+Claude opens the sign-in page: enter the primary mailbox and its password,
+optionally more mailboxes, tick what else to allow, and **Allow access**.
+
+### ChatGPT
+
+ChatGPT uses the same OAuth flow (dynamic client registration and PKCE),
+with its callback on `chatgpt.com`. On the server, allow it first:
+
+```
+ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,chatgpt.com
+```
+
+Then in ChatGPT (custom connectors need Developer Mode, which OpenAI limits
+to some plans, and the menu names change between releases):
+
+1. Settings → Apps & Connectors → Advanced settings → turn on **Developer
+   mode**.
+2. Back in Apps & Connectors, **Create** a connector: any name, MCP server
+   URL `https://<host>/mcp`, authentication **OAuth**.
+3. ChatGPT registers itself and opens the gateway's sign-in page; sign in
+   as for Claude.
+
+The sign-in page shows where access goes (`https://chatgpt.com/...`); if it
+shows any other host, stop.
+
+### Adding or removing mailboxes later
+
+Ask the assistant to "add a mailbox". It calls `add_mailbox` and gives you a
+link; open it yourself, sign in to the mailbox to add, and it is part of the
+connection immediately. Never type a mailbox password into the chat.
+"Remove <address>" calls `remove_mailbox`.
 
 ## Deploying
 
@@ -224,8 +271,9 @@ docker compose logs -f
 
 Upgrade: read CHANGELOG.md, bump the pinned tag, then `docker compose pull && docker compose up -d`.
 
-Then in Claude (via a 443 front end, see above): Settings → Connectors → Add custom connector →
-`https://<PUBLIC_HOST>:<PUBLIC_PORT>/mcp`.
+Then connect a client as described under [Connecting](#connecting). Note
+that claude.ai only reaches port 443, so this standalone setup needs a 443
+front end for it.
 
 ## Development
 

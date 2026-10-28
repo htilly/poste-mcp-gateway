@@ -3,6 +3,18 @@
 Capability changes are called out first: a new version can let an assistant
 do more with a mailbox, so read this before bumping a pinned image tag.
 
+## 0.4.0
+
+**New capability.**
+- `add_mailbox`: a single-use link (10 minutes) to a gateway page where the
+  user signs in to another mailbox and adds it to the existing connection,
+  no reconnect, password never in the chat. Same allowlist and login guard as
+  sign-in. `remove_mailbox` removes an added mailbox. Up to five mailboxes
+  per connection.
+- ChatGPT as a client: allow `chatgpt.com` in `ALLOWED_REDIRECT_HOSTS`; the
+  server's origin is now accepted as the RFC 8707 resource indicator, as
+  ChatGPT may send it. README documents connecting from ChatGPT.
+
 ## 0.3.0
 
 **New capability.**
