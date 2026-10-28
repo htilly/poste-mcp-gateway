@@ -96,12 +96,49 @@ neutralized so a message cannot close the block early.
 | `LISTEN_HOST` / `LISTEN_PORT` | `0.0.0.0` / `8080` | Inside the container network only. |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | `3600` / `2592000` | Seconds. |
 
-## Deploying on the mail server
+## Deploying
 
-`deploy/` holds the compose project: the gateway plus a Caddy built with the
+**Claude only connects to port 443.** claude.ai's connector service does
+not reach custom connectors on other ports (verified: requests to `:443`
+arrived, requests to `:8443` never left Anthropic). The gateway therefore
+has to be served at `https://<host>/mcp` on the standard port. On the
+poste.io host itself, 443 belongs to poste.io's nginx, so in practice:
+
+- **Behind an existing reverse proxy (recommended).** Run the image on any
+  host that already terminates TLS on 443 (nginx/SWAG, Caddy, Traefik) and
+  can reach poste.io on 993. Publish the gateway on `127.0.0.1` only, set
+  `PUBLIC_URL=https://<host>` (no port), and proxy `/` to it with
+  `X-Forwarded-For` set and response buffering off (MCP streams server-sent
+  events). The gateway trusts exactly one proxy hop for the client IP. Use a
+  DNS-only record, not a CDN proxy, if the CDN should not see mail content.
+- **`deploy/`** (below) runs gateway plus Caddy on the mail server itself, on
+  a non-standard port. That works for clients that can use another port, but
+  not as a claude.ai connector.
+
+### Example nginx location (SWAG style)
+
+```nginx
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name mail-mcp.*;
+    include /config/nginx/ssl.conf;
+    location / {
+        include /config/nginx/proxy.conf;   # sets X-Forwarded-For etc.
+        proxy_pass http://127.0.0.1:8770;   # gateway published on loopback only
+        proxy_buffering off;
+    }
+}
+```
+
+### Standalone on the mail server (`deploy/`)
+
+`deploy/` holds a compose project: the gateway plus a Caddy built with the
 Cloudflare DNS plugin, because ports 80/443 belong to poste.io and the
 certificate has to come via DNS-01. It assumes poste.io runs on the same
 host (set `IMAP_HOST_IP` otherwise) and that the zone is on Cloudflare.
+Docker publishes the port past ufw for IPv4 only; for IPv6 the port also
+needs a ufw rule (`ufw allow <PUBLIC_PORT>/tcp`).
 
 All site-specific values (hostnames, port, ACME email, allowed users) go in
 `deploy/.env`, which is gitignored; see `deploy/.env.example`.
@@ -129,7 +166,7 @@ docker compose logs -f
 
 Upgrade: `docker compose pull && docker compose up -d`.
 
-Then in Claude: Settings → Connectors → Add custom connector →
+Then in Claude (via a 443 front end, see above): Settings → Connectors → Add custom connector →
 `https://<PUBLIC_HOST>:<PUBLIC_PORT>/mcp`.
 
 ## Development

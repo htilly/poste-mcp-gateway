@@ -40,8 +40,9 @@ change it.
 
 ## How it connects
 
-- **R8. Custom connector.** Reachable at `https://<mail host>:8443/mcp`
-  (MCP streamable HTTP) and usable as a claude.ai custom connector: OAuth 2.1
+- **R8. Custom connector.** Reachable at `https://<host>/mcp` on port 443,
+  because claude.ai does not connect to custom connectors on other ports.
+  MCP streamable HTTP, usable as a claude.ai custom connector: OAuth 2.1
   with PKCE, dynamic client registration, and the RFC 9728 / RFC 8414
   metadata documents.
 - **R9. TLS.** Valid public certificate for the mail host's name, obtained without
