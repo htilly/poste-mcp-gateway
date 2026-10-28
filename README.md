@@ -106,16 +106,28 @@ host (set `IMAP_HOST_IP` otherwise) and that the zone is on Cloudflare.
 All site-specific values (hostnames, port, ACME email, allowed users) go in
 `deploy/.env`, which is gitignored; see `deploy/.env.example`.
 
+Images are built by GitHub Actions (`.github/workflows/ci.yml`) after the
+unit and live-IMAP tests pass, and pushed to GHCR:
+`ghcr.io/<owner>/poste-mcp-gateway` and `ghcr.io/<owner>/poste-mcp-gateway-caddy`,
+tagged `latest` (main), `sha-xxxxxxx` and the version on `v*` tags. The
+server only needs `deploy/compose.yaml`, `deploy/caddy/Caddyfile` and the
+files below; it never builds anything.
+
 ```bash
-# on the mail server, from a copy of this repo
-cd poste-mcp-gateway/deploy
+# on the mail server
+mkdir -p poste-mcp-gateway/caddy && cd poste-mcp-gateway
+# copy deploy/compose.yaml, deploy/.env.example and deploy/caddy/Caddyfile here
 install -d -m 700 secrets state caddy-data
 (umask 077; openssl rand -hex 32 > secrets/vault_key)
 # secrets/cf_token: Cloudflare API token, Zone:DNS:Edit on your zone only (chmod 600)
 cp .env.example .env && chmod 600 .env              # fill in your values
-docker compose up -d --build
+# private package? log in once with a token that has read:packages:
+#   docker login ghcr.io -u <user>
+docker compose pull && docker compose up -d
 docker compose logs -f
 ```
+
+Upgrade: `docker compose pull && docker compose up -d`.
 
 Then in Claude: Settings → Connectors → Add custom connector →
 `https://<PUBLIC_HOST>:<PUBLIC_PORT>/mcp`.

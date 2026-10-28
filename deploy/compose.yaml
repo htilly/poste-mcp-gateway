@@ -16,8 +16,9 @@ name: poste-mcp-gateway
 
 services:
   gateway:
-    build: ..
-    image: poste-mcp-gateway:local
+    # Built and pushed by .github/workflows/ci.yml. Pin IMAGE_TAG to a
+    # sha-xxxxxxx or version tag in .env to control upgrades.
+    image: ${IMAGE_REPO:-ghcr.io/htilly/poste-mcp-gateway}:${IMAGE_TAG:-latest}
     container_name: poste-mcp-gateway
     restart: unless-stopped
     user: "1000:1000"
@@ -54,8 +55,7 @@ services:
       - gateway
 
   caddy:
-    build: ./caddy
-    image: poste-mcp-gateway-caddy:2.11.7
+    image: ${IMAGE_REPO:-ghcr.io/htilly/poste-mcp-gateway}-caddy:${IMAGE_TAG:-latest}
     container_name: poste-mcp-gateway-caddy
     restart: unless-stopped
     user: "1000:1000"

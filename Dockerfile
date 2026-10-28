@@ -12,7 +12,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/dist ./dist
-RUN mkdir -p /state && chown node:node /state
+# Root-owned and world-readable whatever the build context's modes were
+# (a context unpacked with umask 077 otherwise leaves files unreadable to node).
+RUN chmod -R a+rX,go-w /app && mkdir -p /state && chown node:node /state
 USER node
 EXPOSE 8080
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \

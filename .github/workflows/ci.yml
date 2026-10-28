@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  # Live IMAP tests against Dovecot, the server poste.io runs. Covers the
+  # read path end to end and that EXAMINE makes the server refuse writes.
+  live-imap:
+    runs-on: ubuntu-latest
+    services:
+      dovecot:
+        image: dovecot/dovecot:2.4.1
+        env:
+          USER_PASSWORD: dovecot-test
+        ports:
+          - 4993:31993
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Wait for Dovecot
+        run: for i in $(seq 1 30); do nc -z localhost 4993 && exit 0; sleep 1; done; exit 1
+      - run: npx vitest run test/live.test.ts
+        env:
+          LIVE_IMAP: "1"
+          LIVE_IMAP_SERVER: dovecot
+          LIVE_IMAP_PORT: "4993"
+          LIVE_IMAP_PASSWORD: dovecot-test
+
+  image:
+    needs: [test, live-imap]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: gateway
+            context: .
+            image: ghcr.io/${{ github.repository }}
+          - name: caddy
+            context: deploy/caddy
+            image: ghcr.io/${{ github.repository }}-caddy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha,format=short
+      - uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
