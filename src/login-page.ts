@@ -1,0 +1,56 @@
+export interface LoginView {
+  pendingId: string;
+  clientName: string;
+  redirectHost: string;
+  message?: string;
+}
+
+const escapeHtml = (s: string) =>
+  s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+
+/**
+ * The only page this service serves. Names the client and where it will
+ * redirect, because dynamic registration lets anyone register a client and
+ * the user is the one deciding whether to trust it.
+ */
+export function renderLoginPage(view: LoginView): string {
+  const message = view.message ? `<p class="error" role="alert">${escapeHtml(view.message)}</p>` : '';
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in to mail</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #f6f6f4; --card: #fff; --muted: #666; --accent: #2b5fd9; --err: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #151515; --card: #1f1f1f; --muted: #aaa; --accent: #7aa2ff; --err: #ff8a80; } }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--fg);
+         font: 16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { width: min(26rem, calc(100% - 2rem)); background: var(--card); border-radius: 12px; padding: 1.75rem; box-shadow: 0 1px 4px #0002; }
+  h1 { font-size: 1.25rem; margin: 0 0 .5rem; }
+  p { margin: .25rem 0 1rem; color: var(--muted); }
+  label { display: block; margin: .75rem 0 .25rem; font-weight: 600; }
+  input { box-sizing: border-box; width: 100%; padding: .6rem .7rem; font: inherit; border: 1px solid #8886; border-radius: 8px; background: transparent; color: inherit; }
+  button { margin-top: 1.25rem; width: 100%; padding: .7rem; font: inherit; font-weight: 600; border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; }
+  .error { color: var(--err); }
+  .note { font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sign in to your mailbox</h1>
+  <p><strong>${escapeHtml(view.clientName)}</strong> (returning to <strong>${escapeHtml(view.redirectHost)}</strong>) is asking to <strong>read</strong> your mail. It will not be able to send, move, delete or change anything.</p>
+  ${message}
+  <form method="post" action="/login" autocomplete="on">
+    <input type="hidden" name="pending" value="${escapeHtml(view.pendingId)}">
+    <label for="user">Email address</label>
+    <input id="user" name="user" type="email" autocomplete="username" required autofocus>
+    <label for="password">Mail password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Allow read access</button>
+  </form>
+  <p class="note">Only invited addresses can sign in. You can revoke access at any time.</p>
+</main>
+</body>
+</html>`;
+}

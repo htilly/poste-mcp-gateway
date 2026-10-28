@@ -1,0 +1,16 @@
+{
+	admin off
+	# No :80 listener; ports 80/443 on this host belong to poste.io.
+	auto_https disable_redirects
+	email {$ACME_EMAIL}
+}
+
+https://{$PUBLIC_HOST}:{$PUBLIC_PORT} {
+	tls {
+		# Token scoped to Zone:DNS:Edit on this one zone only.
+		dns cloudflare {file./run/secrets/cf_token}
+		resolvers 1.1.1.1
+	}
+	encode zstd gzip
+	reverse_proxy gateway:8080
+}

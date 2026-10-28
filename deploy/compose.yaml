@@ -1,0 +1,105 @@
+# poste-mcp-gateway on the mailserver, beside poste.io.
+#
+# Isolated from poste.io (/config/docker-compose.yml) on purpose:
+#   - own compose project and own bridge network (never network_mode: host)
+#   - no volumes shared with poste.io; /mnt/posteio is never mounted
+#   - reaches poste.io only as an IMAP client, over IMAPS (993)
+#   - mail-update.sh only manages /config, so it never touches this stack
+#
+# One published port (PUBLIC_PORT, on caddy). Docker-published ports bypass
+# ufw, so it is public by design; OAuth sign-in with an allowlisted poste.io
+# mailbox is the gate.
+#
+# Every site-specific value comes from .env (see .env.example).
+
+name: poste-mcp-gateway
+
+services:
+  gateway:
+    build: ..
+    image: poste-mcp-gateway:local
+    container_name: poste-mcp-gateway
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      PUBLIC_URL: https://${PUBLIC_HOST:?set PUBLIC_HOST in .env}:${PUBLIC_PORT:-8443}
+      IMAP_HOST: ${IMAP_HOST:?set IMAP_HOST in .env}
+      IMAP_PORT: "993"
+      ALLOWED_USERS: ${ALLOWED_USERS:?set ALLOWED_USERS in .env}
+      VAULT_KEY_FILE: /run/secrets/vault_key
+      STATE_FILE: /state/gateway.json
+    secrets:
+      - vault_key
+    volumes:
+      - ./state:/state
+    extra_hosts:
+      # A mail host often maps its own name to 127.0.1.1 in /etc/hosts, which
+      # leaks into container DNS. Pin the name to the Docker host (where
+      # poste.io listens) or IMAP_HOST_IP. TLS is still checked against the name.
+      - "${IMAP_HOST}:${IMAP_HOST_IP:-host-gateway}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - gateway
+
+  caddy:
+    build: ./caddy
+    image: poste-mcp-gateway-caddy:2.11.7
+    container_name: poste-mcp-gateway-caddy
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      - gateway
+    ports:
+      - "${PUBLIC_PORT:-8443}:${PUBLIC_PORT:-8443}"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      PUBLIC_PORT: ${PUBLIC_PORT:-8443}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /config
+    secrets:
+      - cf_token
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-data:/data
+    read_only: true
+    tmpfs:
+      - /config:size=8m,uid=1000,gid=1000
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - gateway
+
+secrets:
+  vault_key:
+    # 32 random bytes, hex: openssl rand -hex 32 > secrets/vault_key; chmod 600
+    file: ./secrets/vault_key
+  cf_token:
+    # Cloudflare API token, Zone:DNS:Edit on the one zone only. chmod 600.
+    file: ./secrets/cf_token
+
+networks:
+  gateway:
+    name: poste-mcp-gateway
+    driver: bridge
