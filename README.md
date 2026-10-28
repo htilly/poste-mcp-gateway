@@ -1,15 +1,74 @@
 # poste-mcp-gateway
 
 An MCP gateway into poste.io mailboxes. A small, invited group of mailbox
-owners add `https://mail.example.com/mcp` as a custom connector in Claude,
-sign in once with their own poste.io address and password, and Claude can
-then work with **their** mailboxes (up to five of their own in one
-connection). It also works as a ChatGPT connector. Reading is always allowed; organizing
-(flags, moves, Trash, drafts) and sending are separate permissions each
-user ticks at sign-in, and sending must also be enabled per address by the
-administrator.
+owners add it as a custom connector in Claude or ChatGPT, sign in once with
+their own poste.io address and password, and the assistant can then work
+with **their** mailboxes (up to five of their own in one connection).
+Reading is always allowed; organizing (flags, moves, Trash, drafts) and
+sending are separate permissions each user ticks at sign-in, and sending
+must also be enabled per address by the administrator.
 
 What it has to achieve, and why, is in [docs/requirements.md](docs/requirements.md).
+Running your own gateway: see [Deploying](#deploying).
+
+## Connect your mailbox
+
+You need the gateway's address from your administrator, e.g.
+`https://mail.example.com/mcp`, and your mailbox must be on its invite list.
+
+### Claude
+
+Works on claude.ai and in the desktop and mobile apps once added.
+
+1. Settings → Connectors → **Add custom connector**.
+2. Name it (e.g. "Mail") and paste the gateway address, ending in `/mcp`.
+3. Click **Connect**. The gateway's sign-in page opens.
+4. Enter your email address and mail password. Optionally, under **Add
+   more of your mailboxes**, add up to two more of your own.
+5. Tick what else to allow: **Organize, delete and drafts** and/or **Send
+   mail as you**. Leave both unticked for read-only access.
+6. Click **Allow access** once and wait a few seconds; you are sent back to
+   Claude.
+7. Try it: *"Which mailboxes are connected?"* or *"What came in today?"*
+
+### ChatGPT
+
+Custom connectors are set up on **chatgpt.com in a browser**, not in the
+mobile apps, and need Developer mode, which OpenAI offers on some plans only
+(Plus/Pro may be limited to read-only tools). Menu names change between
+releases.
+
+1. Turn on **Developer mode**: personal accounts under Settings → Security
+   and login; workspaces under Settings → Apps → Advanced settings.
+2. Under Apps (or Plugins), add a connector with **+**: any name, the
+   gateway address ending in `/mcp`, authentication **OAuth**.
+3. ChatGPT opens the gateway's sign-in page; continue as in steps 4–6 for
+   Claude.
+4. In a chat, choose the connector via **+** → Developer mode.
+
+> Administrators: ChatGPT can only connect if the gateway allows its callback
+> host: `ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,chatgpt.com`.
+
+### Before you click "Allow access"
+
+The sign-in page shows where access goes. It should be
+`https://claude.ai/...` or `https://chatgpt.com/...`. If it shows any other
+address, stop: someone else is asking for your mailbox.
+
+### Adding or removing mailboxes later
+
+Ask the assistant to *"add a mailbox"*. It gives you a one-time link (valid
+10 minutes); open it yourself, sign in to the mailbox to add, and it is part
+of the connection immediately. Never type a mailbox password into the chat.
+*"Remove <address>"* takes one out again (not the first one).
+
+### Disconnecting
+
+Remove the connector in Claude or ChatGPT. If the app revokes its token when
+you do, the gateway deletes the stored passwords at once; otherwise they are
+deleted when the connection expires (after at most 90 days unused or not),
+or straight away if the administrator removes your address. Changing your
+mail password also cuts off access.
 
 ## How it works
 
@@ -139,7 +198,8 @@ puts the limits in the server:
 
 ## Revoking access
 
-- A user: disconnect the connector in Claude (calls the revocation endpoint).
+- A user: remove the connector in Claude or ChatGPT (deletes the grant if the
+  app calls the revocation endpoint), or change the mail password.
 - An admin: remove the address from `ALLOWED_USERS` and restart; grants for
   addresses no longer allowed are deleted at startup. Removing an address
   from `SEND_USERS` takes send away on the next request. An address removed
@@ -166,46 +226,6 @@ puts the limits in the server:
 | `STATE_FILE` | `/state/gateway.json` | Clients and grants. |
 | `LISTEN_HOST` / `LISTEN_PORT` | `0.0.0.0` / `8080` | Inside the container; publish it on loopback only. |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | `3600` / `2592000` | Seconds. |
-
-## Connecting
-
-### Claude
-
-Settings → Connectors → **Add custom connector** → URL `https://<host>/mcp`.
-Claude opens the sign-in page: enter the primary mailbox and its password,
-optionally more mailboxes, tick what else to allow, and **Allow access**.
-
-### ChatGPT
-
-ChatGPT uses the same OAuth flow (dynamic client registration and PKCE),
-with its callback on `chatgpt.com`. On the server, allow it first:
-
-```
-ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,chatgpt.com
-```
-
-Then on **chatgpt.com in a browser**. Developer mode and custom connectors
-are set up on the web only, not in the mobile apps; OpenAI limits them to
-some plans (Plus/Pro may be restricted to read-only tools), and the menu
-names change between releases:
-
-1. Turn on **Developer mode**: personal accounts under Settings → Security
-   and login; workspaces under Settings → Apps → Advanced settings.
-2. Add the connector under Apps (or Plugins) with **+**: any name, MCP
-   server URL `https://<host>/mcp`, authentication **OAuth**.
-3. ChatGPT registers itself and opens the gateway's sign-in page; sign in
-   as for Claude.
-4. In a chat, pick it via **+** → Developer mode.
-
-The sign-in page shows where access goes (`https://chatgpt.com/...`); if it
-shows any other host, stop.
-
-### Adding or removing mailboxes later
-
-Ask the assistant to "add a mailbox". It calls `add_mailbox` and gives you a
-link; open it yourself, sign in to the mailbox to add, and it is part of the
-connection immediately. Never type a mailbox password into the chat.
-"Remove <address>" calls `remove_mailbox`.
 
 ## Deploying
 
@@ -281,7 +301,7 @@ docker compose logs -f
 
 Upgrade: read CHANGELOG.md, bump the pinned tag, then `docker compose pull && docker compose up -d`.
 
-Then connect a client as described under [Connecting](#connecting). Note
+Then connect as described under [Connect your mailbox](#connect-your-mailbox). Note
 that claude.ai only reaches port 443, so this standalone setup needs a 443
 front end for it.
 
