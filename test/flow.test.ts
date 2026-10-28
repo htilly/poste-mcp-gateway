@@ -312,6 +312,7 @@ describe('OAuth + MCP flow', () => {
     }).toString();
     const res = await fetch(url, { redirect: 'manual' });
     expect(res.headers.get('content-security-policy')).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]+'/);
+    expect(res.headers.get('content-security-policy')).toContain(`form-action 'self' ${new URL(REDIRECT).origin};`);
     expect(await res.text()).toContain('<script>');
   });
 

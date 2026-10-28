@@ -26,15 +26,32 @@ const SUBMIT_ONCE_SCRIPT =
   "if(b.disabled){e.preventDefault();return;}" +
   "b.disabled=true;b.textContent='Checking with the mail server\\u2026';});";
 
-/** The page's CSP: no script runs except the one above, pinned by hash. */
-export const LOGIN_PAGE_CSP = [
-  "default-src 'none'",
-  "style-src 'unsafe-inline'",
-  `script-src 'sha256-${createHash('sha256').update(SUBMIT_ONCE_SCRIPT).digest('base64')}'`,
-  "form-action 'self'",
-  "frame-ancestors 'none'",
-  "base-uri 'none'",
-].join('; ');
+const SCRIPT_HASH = createHash('sha256').update(SUBMIT_ONCE_SCRIPT).digest('base64');
+
+/**
+ * The pages' CSP: no script runs except the one above, pinned by hash.
+ *
+ * form-action also governs where a form submission may be redirected
+ * (Chrome enforces this), and a successful sign-in answers with a redirect
+ * to the OAuth client's callback. So the sign-in page allows exactly that
+ * callback's origin, which registration already limited to allowed hosts;
+ * every other page allows only itself.
+ */
+export function pageCsp(redirectUri?: string): string {
+  let formAction = "'self'";
+  if (redirectUri) {
+    const origin = new URL(redirectUri).origin;
+    if (/^https?:\/\/[a-z0-9.:\-\[\]]+$/i.test(origin)) formAction += ` ${origin}`;
+  }
+  return [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    `script-src 'sha256-${SCRIPT_HASH}'`,
+    `form-action ${formAction}`,
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+  ].join('; ');
+}
 
 /**
  * The only page this service serves. Names the client and where it will

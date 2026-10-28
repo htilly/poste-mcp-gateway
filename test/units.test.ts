@@ -5,7 +5,7 @@ import { LoginGuard } from '../src/login-guard.js';
 import { isAllowedRedirectUri, parseAllowedUsers, parseHosts, parseVaultKey } from '../src/config.js';
 import { untrusted } from '../src/tools.js';
 import { buildSearch } from '../src/mail.js';
-import { LOGIN_PAGE_CSP, renderLoginPage } from '../src/login-page.js';
+import { pageCsp, renderLoginPage } from '../src/login-page.js';
 import { createHash } from 'node:crypto';
 
 describe('Vault', () => {
@@ -225,7 +225,13 @@ describe('login page', () => {
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]!);
     expect(scripts).toHaveLength(1);
     const hash = createHash('sha256').update(scripts[0]!).digest('base64');
-    expect(LOGIN_PAGE_CSP).toContain(`script-src 'sha256-${hash}'`);
-    expect(LOGIN_PAGE_CSP).toContain("default-src 'none'");
+    expect(pageCsp()).toContain(`script-src 'sha256-${hash}'`);
+    expect(pageCsp()).toContain("default-src 'none'");
+  });
+
+  it('lets the sign-in form redirect to its own callback origin only', () => {
+    expect(pageCsp()).toContain("form-action 'self';");
+    expect(pageCsp('https://chatgpt.com/connector_platform_oauth_redirect')).toContain("form-action 'self' https://chatgpt.com;");
+    expect(pageCsp('http://127.0.0.1:33418/callback')).toContain("form-action 'self' http://127.0.0.1:33418;");
   });
 });

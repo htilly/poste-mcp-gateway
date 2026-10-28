@@ -18,7 +18,7 @@ import { Vault, hashToken, newToken } from './crypto.js';
 import type { Grant, GrantAccount, Store } from './store.js';
 import { LoginGuard } from './login-guard.js';
 import type { ImapCredentials, LoginResult } from './imap.js';
-import { LOGIN_PAGE_CSP, renderLoginPage } from './login-page.js';
+import { pageCsp, renderLoginPage } from './login-page.js';
 import { SCOPES, type Scope } from './scopes.js';
 import { silentAudit, type Audit } from './audit.js';
 
@@ -611,7 +611,7 @@ function sendLoginPage(
     .set({
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
-      'Content-Security-Policy': LOGIN_PAGE_CSP,
+      'Content-Security-Policy': pageCsp(view.params.redirectUri),
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer',
     })

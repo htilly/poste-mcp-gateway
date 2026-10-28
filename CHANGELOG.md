@@ -3,6 +3,14 @@
 Capability changes are called out first: a new version can let an assistant
 do more with a mailbox, so read this before bumping a pinned image tag.
 
+## 0.4.1
+
+**Fix.** Sign-in could hang on "Checking with the mail server…": the page's
+CSP had `form-action 'self'`, and Chrome applies form-action to the redirect
+that follows the submission, so the redirect to the client's callback (e.g.
+chatgpt.com) was blocked. The sign-in page now allows exactly its own
+callback origin; other pages still allow only themselves.
+
 ## 0.4.0
 
 **New capability.**

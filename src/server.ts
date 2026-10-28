@@ -11,7 +11,7 @@ import type { MailWriter } from './mail-write.js';
 import type { MailSender } from './smtp.js';
 import { ALL_SCOPES, SCOPES, isScope, type Scope } from './scopes.js';
 import { silentAudit, type Audit } from './audit.js';
-import { LOGIN_PAGE_CSP, renderAddMailboxPage } from './login-page.js';
+import { pageCsp, renderAddMailboxPage } from './login-page.js';
 import type { Response } from 'express';
 
 function sendPage(res: Response, status: number, html: string): void {
@@ -20,7 +20,7 @@ function sendPage(res: Response, status: number, html: string): void {
     .set({
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
-      'Content-Security-Policy': LOGIN_PAGE_CSP,
+      'Content-Security-Policy': pageCsp(),
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer',
     })
