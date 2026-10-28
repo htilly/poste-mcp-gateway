@@ -5,7 +5,8 @@ import { LoginGuard } from '../src/login-guard.js';
 import { parseAllowedUsers, parseVaultKey } from '../src/config.js';
 import { untrusted } from '../src/tools.js';
 import { buildSearch } from '../src/mail.js';
-import { renderLoginPage } from '../src/login-page.js';
+import { LOGIN_PAGE_CSP, renderLoginPage } from '../src/login-page.js';
+import { createHash } from 'node:crypto';
 
 describe('Vault', () => {
   const vault = new Vault(randomBytes(32));
@@ -147,5 +148,14 @@ describe('login page', () => {
     expect(html).not.toContain('<script>alert(1)</script>');
     expect(html).toContain('&lt;script&gt;');
     expect(html).toContain('value="p&quot;x"');
+  });
+
+  it('allows exactly its own inline script through the CSP', () => {
+    const html = renderLoginPage({ pendingId: 'p', clientName: 'c', redirectHost: 'h' });
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]!);
+    expect(scripts).toHaveLength(1);
+    const hash = createHash('sha256').update(scripts[0]!).digest('base64');
+    expect(LOGIN_PAGE_CSP).toContain(`script-src 'sha256-${hash}'`);
+    expect(LOGIN_PAGE_CSP).toContain("default-src 'none'");
   });
 });

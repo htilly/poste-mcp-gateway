@@ -228,6 +228,32 @@ describe('OAuth + MCP flow', () => {
     expect(loginCalls).toEqual([]);
   });
 
+  it('answers a double submit with the same redirect, for the same address only', async () => {
+    const clientId = await register();
+    const { pending } = await startAuthorize(clientId);
+    const first = await login(pending, 'alice@example.com', 'alice-pw');
+    expect(first.status).toBe(302);
+    const again = await login(pending, 'Alice@Example.com', 'alice-pw');
+    expect(again.status).toBe(302);
+    expect(again.headers.get('location')).toBe(first.headers.get('location'));
+    const other = await login(pending, 'bob@example.com', 'bob-pw');
+    expect(other.status).toBe(400);
+    // The duplicate did not cost a second IMAP login.
+    expect(loginCalls).toEqual(['alice@example.com']);
+  });
+
+  it('serves the sign-in page with a hash-pinned script CSP', async () => {
+    const clientId = await register();
+    const url = new URL('/authorize', base);
+    url.search = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: REDIRECT,
+      code_challenge: 'x'.repeat(43), code_challenge_method: 'S256',
+    }).toString();
+    const res = await fetch(url, { redirect: 'manual' });
+    expect(res.headers.get('content-security-policy')).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]+'/);
+    expect(await res.text()).toContain('<script>');
+  });
+
   it('refuses a wrong password with the same message', async () => {
     const clientId = await register();
     const { pending } = await startAuthorize(clientId);

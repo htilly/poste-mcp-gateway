@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export interface LoginView {
   pendingId: string;
   clientName: string;
@@ -7,6 +9,28 @@ export interface LoginView {
 
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+
+/**
+ * Checking the password against the mail server takes a few seconds. Without
+ * feedback people click again, the browser aborts the first request, and with
+ * it the redirect that carries the authorization code. This disables the
+ * button after the first submit and swallows any further submits.
+ */
+const SUBMIT_ONCE_SCRIPT =
+  "document.querySelector('form').addEventListener('submit',function(e){" +
+  "var b=this.querySelector('button');" +
+  "if(b.disabled){e.preventDefault();return;}" +
+  "b.disabled=true;b.textContent='Checking with the mail server\\u2026';});";
+
+/** The page's CSP: no script runs except the one above, pinned by hash. */
+export const LOGIN_PAGE_CSP = [
+  "default-src 'none'",
+  "style-src 'unsafe-inline'",
+  `script-src 'sha256-${createHash('sha256').update(SUBMIT_ONCE_SCRIPT).digest('base64')}'`,
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+].join('; ');
 
 /**
  * The only page this service serves. Names the client and where it will
@@ -32,6 +56,7 @@ export function renderLoginPage(view: LoginView): string {
   label { display: block; margin: .75rem 0 .25rem; font-weight: 600; }
   input { box-sizing: border-box; width: 100%; padding: .6rem .7rem; font: inherit; border: 1px solid #8886; border-radius: 8px; background: transparent; color: inherit; }
   button { margin-top: 1.25rem; width: 100%; padding: .7rem; font: inherit; font-weight: 600; border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: progress; }
   .error { color: var(--err); }
   .note { font-size: .85rem; }
 </style>
@@ -49,6 +74,7 @@ export function renderLoginPage(view: LoginView): string {
     <input id="password" name="password" type="password" autocomplete="current-password" required>
     <button type="submit">Allow read access</button>
   </form>
+  <script>${SUBMIT_ONCE_SCRIPT}</script>
   <p class="note">Only invited addresses can sign in. You can revoke access at any time.</p>
 </main>
 </body>

@@ -18,12 +18,14 @@ import { Vault, hashToken, newToken } from './crypto.js';
 import type { Grant, Store } from './store.js';
 import { LoginGuard } from './login-guard.js';
 import type { ImapCredentials, LoginResult } from './imap.js';
-import { renderLoginPage } from './login-page.js';
+import { LOGIN_PAGE_CSP, renderLoginPage } from './login-page.js';
 
 export const SCOPE = 'mail.read';
 
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
+/** How long a finished sign-in answers a duplicate submit with the same redirect. */
+const REPLAY_TTL_MS = 60 * 1000;
 
 interface PendingAuthorization {
   clientId: string;
@@ -36,6 +38,13 @@ interface AuthCode {
   user: string;
   sealedPassword: string;
   params: AuthorizationParams;
+  expiresAt: number;
+}
+
+/** A sign-in that already succeeded, kept briefly so a double submit is harmless. */
+interface CompletedSignIn {
+  user: string;
+  location: string;
   expiresAt: number;
 }
 
@@ -78,6 +87,7 @@ const passwordAad = (user: string) => `imap-password:${user}`;
 export class GatewayProvider implements OAuthServerProvider {
   private readonly pending = new Map<string, PendingAuthorization>();
   private readonly codes = new Map<string, AuthCode>();
+  private readonly completed = new Map<string, CompletedSignIn>();
   private readonly access = new Map<string, AccessEntry>();
   private readonly now: () => number;
 
@@ -122,6 +132,14 @@ export class GatewayProvider implements OAuthServerProvider {
    * a wrong password.
    */
   async completeLogin(pendingId: string, user: string, password: string, ip: string): Promise<LoginOutcome> {
+    // A second submit of a form that already signed in (double click, Enter
+    // plus click) gets the same redirect instead of "expired": the browser
+    // usually abandoned the first response, and with it the code.
+    const done = this.completed.get(pendingId);
+    if (done && done.expiresAt > this.now() && done.user === LoginGuard.normalize(user)) {
+      return { kind: 'redirect', location: done.location };
+    }
+
     const pending = this.pending.get(pendingId);
     if (!pending || pending.expiresAt <= this.now()) {
       this.pending.delete(pendingId);
@@ -161,6 +179,7 @@ export class GatewayProvider implements OAuthServerProvider {
     const location = new URL(pending.params.redirectUri);
     location.searchParams.set('code', code);
     if (pending.params.state !== undefined) location.searchParams.set('state', pending.params.state);
+    this.completed.set(pendingId, { user: account, location: location.href, expiresAt: this.now() + REPLAY_TTL_MS });
     return { kind: 'redirect', location: location.href };
   }
 
@@ -309,6 +328,7 @@ export class GatewayProvider implements OAuthServerProvider {
     const now = this.now();
     for (const [k, v] of this.pending) if (v.expiresAt <= now) this.pending.delete(k);
     for (const [k, v] of this.codes) if (v.expiresAt <= now) this.codes.delete(k);
+    for (const [k, v] of this.completed) if (v.expiresAt <= now) this.completed.delete(k);
     for (const [k, v] of this.access) if (v.expiresAt <= now) this.access.delete(k);
   }
 }
@@ -323,7 +343,7 @@ function sendLoginPage(
     .set({
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
-      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      'Content-Security-Policy': LOGIN_PAGE_CSP,
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer',
     })
