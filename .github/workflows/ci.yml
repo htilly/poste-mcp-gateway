@@ -58,6 +58,8 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # Each image stands alone; one failing push must not cancel the other.
+      fail-fast: false
       matrix:
         include:
           - name: gateway
