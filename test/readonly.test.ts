@@ -64,10 +64,10 @@ describe('writes are confined', () => {
 });
 
 function registered(scopes: Scope[]) {
-  const tools: { name: string; annotations?: Record<string, unknown> }[] = [];
+  const tools: { name: string; annotations?: Record<string, unknown>; params: string[] }[] = [];
   const fake = {
-    registerTool: (name: string, config: { annotations?: Record<string, unknown> }) => {
-      tools.push({ name, annotations: config.annotations });
+    registerTool: (name: string, config: { annotations?: Record<string, unknown>; inputSchema?: Record<string, unknown> }) => {
+      tools.push({ name, annotations: config.annotations, params: Object.keys(config.inputSchema ?? {}) });
     },
   } as unknown as McpServer;
   registerTools(fake, {
@@ -76,6 +76,8 @@ function registered(scopes: Scope[]) {
     sender: {} as MailSender,
     scopes,
     credentialsFor: () => ({ grantId: 'g', creds: { user: 'u', password: 'p' } }),
+    accountsFor: () => ['u'],
+    canSend: () => true,
     revokeGrant: () => {},
   });
   return tools;
@@ -98,6 +100,13 @@ describe('tools follow the grant\'s scopes', () => {
     expect(tools.map(t => t.name).sort()).toEqual([...READ_TOOLS, ...SEND_TOOLS].sort());
     for (const t of tools.filter(t => (SEND_TOOLS as readonly string[]).includes(t.name))) {
       expect(t.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true });
+    }
+  });
+
+  it('every mailbox tool takes an optional account; list_accounts does not need one', () => {
+    for (const t of registered([SCOPES.read, SCOPES.modify, SCOPES.send])) {
+      if (t.name === 'list_accounts') expect(t.params).toEqual([]);
+      else expect(t.params).toContain('account');
     }
   });
 

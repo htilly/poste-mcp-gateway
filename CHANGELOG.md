@@ -3,6 +3,19 @@
 Capability changes are called out first: a new version can let an assistant
 do more with a mailbox, so read this before bumping a pinned image tag.
 
+## 0.3.0
+
+**New capability.**
+- Several of your own mailboxes in one connection: the sign-in page takes
+  the primary mailbox plus up to two more, each verified by logging in to it
+  and required to be on `ALLOWED_USERS`. New `list_accounts` tool; every
+  other tool takes an optional `account`. Send permission (`SEND_USERS`) is
+  checked per mailbox.
+
+**Upgrade note.** The state file is migrated from version 1 to 2 on first
+start (existing connections become single-mailbox connections). Rolling back
+to 0.2.0 afterwards would not read it; users would have to reconnect.
+
 ## 0.2.0
 
 **New capabilities (opt-in).**

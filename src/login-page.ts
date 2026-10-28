@@ -62,6 +62,8 @@ export function renderLoginPage(view: LoginView): string {
   input { box-sizing: border-box; width: 100%; padding: .6rem .7rem; font: inherit; border: 1px solid #8886; border-radius: 8px; background: transparent; color: inherit; }
   button { margin-top: 1.25rem; width: 100%; padding: .7rem; font: inherit; font-weight: 600; border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; }
   button:disabled { opacity: .6; cursor: progress; }
+  details { margin: 1rem 0 0; }
+  summary { cursor: pointer; font-weight: 600; }
   fieldset { border: 1px solid #8884; border-radius: 8px; margin: 1rem 0 0; padding: .5rem .8rem .7rem; }
   legend { font-weight: 600; padding: 0 .3rem; }
   .opt { display: flex; gap: .6rem; align-items: flex-start; margin: .5rem 0 0; font-weight: 400; }
@@ -84,6 +86,18 @@ export function renderLoginPage(view: LoginView): string {
     <input id="user" name="user" type="email" autocomplete="username" required autofocus>
     <label for="password">Mail password</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <details>
+      <summary>Add more of your mailboxes (optional)</summary>
+      <p class="note">Each one is checked by signing in to it, so only mailboxes you have the password for can be added.</p>
+      ${[2, 3]
+        .map(
+          n => `<label for="user${n}">Mailbox ${n}</label>
+      <input id="user${n}" name="user" type="email" autocomplete="off">
+      <label for="password${n}">Password for mailbox ${n}</label>
+      <input id="password${n}" name="password" type="password" autocomplete="off">`,
+        )
+        .join('\n      ')}
+    </details>
     <fieldset>
       <legend>Also allow</legend>
       <label class="opt"><input type="checkbox" name="scope" value="${SCOPES.modify}"${checked(SCOPES.modify)}>

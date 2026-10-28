@@ -144,24 +144,47 @@ describe('LoginGuard', () => {
 });
 
 describe('Store', () => {
-  it('persists grants and deletes by predicate', async () => {
+  const tmpState = async () => {
     const { mkdtempSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
+    return join(mkdtempSync(join(tmpdir(), 'gw-store-')), 'state.json');
+  };
+  const grant = (id: string, ...users: string[]) => ({
+    id, user: users[0]!, accounts: users.map(user => ({ user, sealedPassword: `s-${user}` })), clientId: 'c', scopes: ['mail.read'],
+    refreshHash: `h-${id}`, refreshExpiresAt: Date.now() + 1000, createdAt: 0, lastUsedAt: 0,
+  });
+
+  it('persists grants with their mailboxes', async () => {
     const { Store } = await import('../src/store.js');
-    const path = join(mkdtempSync(join(tmpdir(), 'gw-store-')), 'state.json');
-    const grant = (id: string, user: string) => ({
-      id, user, clientId: 'c', sealedPassword: 's', scopes: ['mail.read'],
-      refreshHash: `h-${id}`, refreshExpiresAt: Date.now() + 1000, createdAt: 0, lastUsedAt: 0,
-    });
-    const store = new Store(path);
-    store.putGrant(grant('1', 'alice@x'));
-    store.putGrant(grant('2', 'bob@x'));
+    const path = await tmpState();
+    new Store(path).putGrant(grant('1', 'alice@x', 'alice2@x'));
     const reopened = new Store(path);
-    expect(reopened.listGrants().map(g => g.user).sort()).toEqual(['alice@x', 'bob@x']);
-    expect(reopened.deleteGrantsWhere(g => g.user === 'bob@x')).toBe(1);
-    expect(new Store(path).listGrants().map(g => g.user)).toEqual(['alice@x']);
-    expect(new Store(path).findGrantByRefreshHash('h-1')?.id).toBe('1');
+    expect(reopened.getGrant('1')?.accounts.map(a => a.user)).toEqual(['alice@x', 'alice2@x']);
+    expect(reopened.findGrantByRefreshHash('h-1')?.id).toBe('1');
+  });
+
+  it('removes disallowed mailboxes, and whole grants whose primary is disallowed', async () => {
+    const { Store } = await import('../src/store.js');
+    const path = await tmpState();
+    const store = new Store(path);
+    store.putGrant(grant('1', 'alice@x', 'old@x'));
+    store.putGrant(grant('2', 'old@x', 'alice@x'));
+    expect(store.pruneAccounts(u => u !== 'old@x')).toEqual({ accounts: 1, grants: 1 });
+    const reopened = new Store(path);
+    expect(reopened.getGrant('1')?.accounts.map(a => a.user)).toEqual(['alice@x']);
+    expect(reopened.getGrant('2')).toBeUndefined();
+  });
+
+  it('migrates a version-1 state file (one mailbox per grant)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const { Store } = await import('../src/store.js');
+    const path = await tmpState();
+    const v1grant = { id: 'g', user: 'alice@x', clientId: 'c', sealedPassword: 'sealed', scopes: ['mail.read'], refreshHash: 'h', refreshExpiresAt: 1, createdAt: 0, lastUsedAt: 0 };
+    writeFileSync(path, JSON.stringify({ version: 1, clients: {}, grants: { g: v1grant } }));
+    const migrated = new Store(path).getGrant('g')!;
+    expect(migrated.accounts).toEqual([{ user: 'alice@x', sealedPassword: 'sealed' }]);
+    expect(migrated).not.toHaveProperty('sealedPassword');
   });
 });
 

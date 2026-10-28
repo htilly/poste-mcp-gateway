@@ -15,7 +15,7 @@ import {
   InvalidTokenError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { Vault, hashToken, newToken } from './crypto.js';
-import type { Grant, Store } from './store.js';
+import type { Grant, GrantAccount, Store } from './store.js';
 import { LoginGuard } from './login-guard.js';
 import type { ImapCredentials, LoginResult } from './imap.js';
 import { LOGIN_PAGE_CSP, renderLoginPage } from './login-page.js';
@@ -26,6 +26,13 @@ const PENDING_TTL_MS = 10 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
 /** How long a finished sign-in answers a duplicate submit with the same redirect. */
 const REPLAY_TTL_MS = 60 * 1000;
+/** Mailboxes one sign-in can connect: the primary plus extras. Matches the rows on the sign-in page. */
+export const MAX_ACCOUNTS_PER_GRANT = 3;
+
+export interface Login {
+  user: string;
+  password: string;
+}
 
 /** One answer for every refused sign-in, so the page reveals neither the allowlist nor lock state. */
 const SIGN_IN_FAILED =
@@ -41,8 +48,9 @@ interface PendingAuthorization {
 
 interface AuthCode {
   clientId: string;
+  /** Primary mailbox. */
   user: string;
-  sealedPassword: string;
+  accounts: GrantAccount[];
   scopes: Scope[];
   params: AuthorizationParams;
   expiresAt: number;
@@ -148,7 +156,13 @@ export class GatewayProvider implements OAuthServerProvider {
    * mail.send on its next request, not when it next signs in).
    */
   private effectiveScopes(grant: Grant): Scope[] {
-    return grant.scopes.filter(s => s !== SCOPES.send || this.opts.canSend(grant.user)) as Scope[];
+    const anyCanSend = grant.accounts.some(a => this.opts.canSend(a.user));
+    return grant.scopes.filter(s => s !== SCOPES.send || anyCanSend) as Scope[];
+  }
+
+  /** Whether this mailbox may send right now. Send tools check it per call. */
+  canSend(user: string): boolean {
+    return this.opts.canSend(LoginGuard.normalize(user));
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
@@ -167,22 +181,31 @@ export class GatewayProvider implements OAuthServerProvider {
   }
 
   /**
-   * Handles the sign-in form. Order matters: the guard runs before any IMAP
-   * traffic, and its verdict for unknown addresses is indistinguishable from
-   * a wrong password.
+   * Handles the sign-in form: one or more mailboxes, the first being the
+   * primary. Order matters: the guard runs before any IMAP traffic, its
+   * verdict for unknown addresses is indistinguishable from a wrong
+   * password, and mailboxes are verified one at a time so every attempt
+   * stays reserved and bounded. Any failure fails the whole sign-in.
    */
   async completeLogin(
     pendingId: string,
-    user: string,
-    password: string,
+    rawLogins: Login[],
     ip: string,
     requested: Scope[] = [],
   ): Promise<LoginOutcome> {
+    const logins: Login[] = [];
+    for (const l of rawLogins) {
+      const user = LoginGuard.normalize(l.user);
+      if (!user && !l.password) continue;
+      if (!logins.some(x => x.user === user)) logins.push({ user, password: l.password });
+    }
+    const primary = logins[0]?.user ?? '';
+
     // A second submit of a form that already signed in (double click, Enter
     // plus click) gets the same redirect instead of "expired": the browser
     // usually abandoned the first response, and with it the code.
     const done = this.completed.get(pendingId);
-    if (done && done.expiresAt > this.now() && done.user === LoginGuard.normalize(user)) {
+    if (done && done.expiresAt > this.now() && done.user === primary) {
       return { kind: 'redirect', location: done.location };
     }
 
@@ -200,36 +223,43 @@ export class GatewayProvider implements OAuthServerProvider {
       kind: 'retry', status, message, pendingId, client, params: pending.params, requested,
     });
 
-    const account = LoginGuard.normalize(user);
-    if (!password || pending.busy) return retry(401, SIGN_IN_FAILED);
-    const decision = this.opts.guard.check(account, ip);
-    if (!decision.ok) return retry(401, SIGN_IN_FAILED);
+    if (logins.length === 0 || logins.length > MAX_ACCOUNTS_PER_GRANT || logins.some(l => !l.user || !l.password)) {
+      return retry(401, SIGN_IN_FAILED);
+    }
+    if (pending.busy) return retry(401, SIGN_IN_FAILED);
 
-    // The guard reserved this attempt; settle it whatever happens.
     pending.busy = true;
-    let result: LoginResult = 'unavailable';
     try {
-      result = await this.opts.verifyLogin({ user: account, password });
+      for (const { user, password } of logins) {
+        if (!this.opts.guard.check(user, ip).ok) return retry(401, SIGN_IN_FAILED);
+        // The guard reserved this attempt; settle it whatever happens.
+        let result: LoginResult = 'unavailable';
+        try {
+          result = await this.opts.verifyLogin({ user, password });
+        } finally {
+          if (result === 'unavailable') this.opts.guard.release(user, ip);
+          else this.opts.guard.record(user, ip, result === 'ok');
+        }
+        if (result === 'unavailable') return retry(503, 'The mail server could not be reached. Try again shortly.');
+        if (result !== 'ok') return retry(401, SIGN_IN_FAILED);
+      }
     } finally {
       pending.busy = false;
-      if (result === 'unavailable') this.opts.guard.release(account, ip);
-      else this.opts.guard.record(account, ip, result === 'ok');
     }
-    if (result === 'unavailable') return retry(503, 'The mail server could not be reached. Try again shortly.');
-    if (result !== 'ok') return retry(401, SIGN_IN_FAILED);
 
     // Read is always granted; modify and send only when ticked, and send only
-    // for addresses allowed to send. Anything else in the form is ignored.
+    // if some mailbox may send (send tools re-check per mailbox). Anything
+    // else in the form is ignored.
     const scopes: Scope[] = [SCOPES.read];
     if (requested.includes(SCOPES.modify)) scopes.push(SCOPES.modify);
-    if (requested.includes(SCOPES.send) && this.opts.canSend(account)) scopes.push(SCOPES.send);
+    if (requested.includes(SCOPES.send) && logins.some(l => this.opts.canSend(l.user))) scopes.push(SCOPES.send);
 
     this.pending.delete(pendingId);
     const code = newToken();
     this.codes.set(hashToken(code), {
       clientId: client.client_id,
-      user: account,
-      sealedPassword: this.opts.vault.seal(password, passwordAad(account)),
+      user: primary,
+      accounts: logins.map(l => ({ user: l.user, sealedPassword: this.opts.vault.seal(l.password, passwordAad(l.user)) })),
       scopes,
       params: pending.params,
       expiresAt: this.now() + CODE_TTL_MS,
@@ -237,8 +267,15 @@ export class GatewayProvider implements OAuthServerProvider {
     const location = new URL(pending.params.redirectUri);
     location.searchParams.set('code', code);
     if (pending.params.state !== undefined) location.searchParams.set('state', pending.params.state);
-    this.completed.set(pendingId, { user: account, location: location.href, expiresAt: this.now() + REPLAY_TTL_MS });
-    this.audit('sign_in', { user: account, ip, clientId: client.client_id, clientName: client.client_name, scopes });
+    this.completed.set(pendingId, { user: primary, location: location.href, expiresAt: this.now() + REPLAY_TTL_MS });
+    this.audit('sign_in', {
+      user: primary,
+      accounts: logins.map(l => l.user),
+      ip,
+      clientId: client.client_id,
+      clientName: client.client_name,
+      scopes,
+    });
     return { kind: 'redirect', location: location.href };
   }
 
@@ -283,7 +320,7 @@ export class GatewayProvider implements OAuthServerProvider {
       id: randomUUID(),
       user: entry.user,
       clientId: client.client_id,
-      sealedPassword: entry.sealedPassword,
+      accounts: entry.accounts,
       scopes: entry.scopes,
       resource: grantResource,
       refreshHash: hashToken(refreshToken),
@@ -292,7 +329,13 @@ export class GatewayProvider implements OAuthServerProvider {
       lastUsedAt: now,
     };
     this.opts.store.putGrant(grant);
-    this.audit('grant_created', { user: grant.user, grantId: grant.id, clientId: grant.clientId, scopes: grant.scopes });
+    this.audit('grant_created', {
+      user: grant.user,
+      accounts: grant.accounts.map(a => a.user),
+      grantId: grant.id,
+      clientId: grant.clientId,
+      scopes: grant.scopes,
+    });
     return this.issue(grant, refreshToken);
   }
 
@@ -393,15 +436,34 @@ export class GatewayProvider implements OAuthServerProvider {
     for (const [key, entry] of this.access) if (entry.grantId === grantId) this.access.delete(key);
   }
 
-  /** The IMAP credentials behind an authenticated request. */
-  credentialsFor(auth: AuthInfo | undefined): { grantId: string; creds: ImapCredentials } {
+  /** The mailboxes an authenticated request may use, primary first. */
+  accountsFor(auth: AuthInfo | undefined): string[] {
+    return this.grantFor(auth).accounts.map(a => a.user);
+  }
+
+  /**
+   * The IMAP credentials for one mailbox of the request's grant (the primary
+   * when `account` is omitted). A mailbox outside the grant is an error:
+   * a request can never reach a mailbox it did not sign in to.
+   */
+  credentialsFor(auth: AuthInfo | undefined, account?: string): { grantId: string; creds: ImapCredentials } {
+    const grant = this.grantFor(auth);
+    const wanted = account ? LoginGuard.normalize(account) : grant.user;
+    const entry = grant.accounts.find(a => a.user === wanted);
+    if (!entry) {
+      throw new Error(`mailbox ${wanted} is not part of this connection; available: ${grant.accounts.map(a => a.user).join(', ')}`);
+    }
+    return {
+      grantId: grant.id,
+      creds: { user: entry.user, password: this.opts.vault.open(entry.sealedPassword, passwordAad(entry.user)) },
+    };
+  }
+
+  private grantFor(auth: AuthInfo | undefined): Grant {
     const grantId = auth?.extra?.grantId;
     const grant = typeof grantId === 'string' ? this.opts.store.getGrant(grantId) : undefined;
     if (!grant) throw new InvalidTokenError('grant no longer exists');
-    return {
-      grantId: grant.id,
-      creds: { user: grant.user, password: this.opts.vault.open(grant.sealedPassword, passwordAad(grant.user)) },
-    };
+    return grant;
   }
 
   private sweep(): void {

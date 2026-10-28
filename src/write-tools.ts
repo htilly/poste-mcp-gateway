@@ -4,7 +4,7 @@ import { buildRaw, forwardDraft, newDraft, replyDraft, type Draft } from './comp
 import { MAX_UIDS, type MailWriter } from './mail-write.js';
 import type { MailReader } from './mail.js';
 import type { MailSender } from './smtp.js';
-import { folder, json, uid } from './tool-helpers.js';
+import { fail, folder, json, uid } from './tool-helpers.js';
 import type { Runner } from './tools.js';
 import type { Audit } from './audit.js';
 
@@ -144,7 +144,17 @@ export function registerModifyTools(server: McpServer, writer: MailWriter, reade
 }
 
 /** Tools for the mail.send scope: mail leaves the mailbox. */
-export function registerSendTools(server: McpServer, sender: MailSender, reader: MailReader, run: Runner): void {
+export function registerSendTools(
+  server: McpServer,
+  sender: MailSender,
+  reader: MailReader,
+  run: Runner,
+  canSend: (user: string) => boolean,
+): void {
+  /** Send permission is per mailbox: a grant can hold mailboxes that may not send. */
+  const mayNotSend = (user: string) =>
+    canSend(user) ? undefined : fail(`${user} is not allowed to send mail through this gateway; use another account or save a draft.`);
+
   server.registerTool(
     'send_message',
     {
@@ -161,6 +171,8 @@ export function registerSendTools(server: McpServer, sender: MailSender, reader:
     },
     async (args, extra) =>
       run(extra.authInfo, async creds => {
+        const denied = mayNotSend(creds.user);
+        if (denied) return denied;
         const draft = newDraft(creds.user, { ...args, text: args.body });
         return json({ ...summary(draft), ...(await sender.send(creds, draft, 'send_message')) });
       }),
@@ -185,6 +197,8 @@ export function registerSendTools(server: McpServer, sender: MailSender, reader:
     },
     async ({ folder, uid, body, reply_all, cc, bcc }, extra) =>
       run(extra.authInfo, async creds => {
+        const denied = mayNotSend(creds.user);
+        if (denied) return denied;
         const draft = await replyDraft(creds.user, await reader.getRawSource(creds, folder, uid), { text: body, replyAll: reply_all, cc, bcc });
         return json({ inReplyTo: { folder, uid }, ...summary(draft), ...(await sender.send(creds, draft, 'reply_to_message')) });
       }),
@@ -207,6 +221,8 @@ export function registerSendTools(server: McpServer, sender: MailSender, reader:
     },
     async ({ folder, uid, to, cc, bcc, body }, extra) =>
       run(extra.authInfo, async creds => {
+        const denied = mayNotSend(creds.user);
+        if (denied) return denied;
         const draft = await forwardDraft(creds.user, await reader.getRawSource(creds, folder, uid), { to, cc, bcc, text: body });
         return json({ forwarded: { folder, uid }, ...summary(draft), ...(await sender.send(creds, draft, 'forward_message')) });
       }),

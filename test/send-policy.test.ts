@@ -81,7 +81,7 @@ describe('client table', () => {
       ({ client_id: id, client_id_issued_at: at, redirect_uris: ['https://claude.ai/cb'] }) as unknown as OAuthClientInformationFull;
     store.addClient(client('in-use', now - 10));
     store.putGrant({
-      id: 'g', user: 'me@example.com', clientId: 'in-use', sealedPassword: 's', scopes: ['mail.read'],
+      id: 'g', user: 'me@example.com', accounts: [{ user: 'me@example.com', sealedPassword: 's' }], clientId: 'in-use', scopes: ['mail.read'],
       refreshHash: 'h', refreshExpiresAt: Date.now() + 1000, createdAt: 0, lastUsedAt: 0,
     });
     for (let i = 1; i < MAX_CLIENTS; i++) store.addClient(client(`c${i}`, now - 5 + i / 1000));

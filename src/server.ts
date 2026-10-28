@@ -25,6 +25,8 @@ export interface AppDeps {
   audit?: Audit;
   /** POST /login requests per IP per 15 minutes. */
   loginRateLimit?: number;
+  /** Client registrations per IP per hour (the SDK's default is 20). */
+  registrationRateLimit?: number;
 }
 
 export function createApp({
@@ -37,6 +39,7 @@ export function createApp({
   version,
   audit = silentAudit,
   loginRateLimit = 20,
+  registrationRateLimit = 20,
 }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
@@ -62,6 +65,7 @@ export function createApp({
       resourceServerUrl: resourceUrl,
       scopesSupported: [...ALL_SCOPES],
       resourceName: 'Mail',
+      clientRegistrationOptions: { rateLimit: { max: registrationRateLimit } },
     }),
   );
 
@@ -70,10 +74,13 @@ export function createApp({
 
   app.post('/login', loginLimiter, express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
     const pending = String(req.body?.pending ?? '');
-    const user = String(req.body?.user ?? '');
-    const password = String(req.body?.password ?? '');
+    // Rows of the form: user/password pairs, the first being the primary mailbox.
+    const users = [req.body?.user ?? []].flat().map(String);
+    const passwords = [req.body?.password ?? []].flat().map(String);
+    const logins = users.map((user, i) => ({ user, password: passwords[i] ?? '' }));
+    const user = users[0] ?? '';
     const requested: Scope[] = [req.body?.scope ?? []].flat().map(String).filter(isScope);
-    const outcome = await provider.completeLogin(pending, user, password, req.ip ?? 'unknown', requested);
+    const outcome = await provider.completeLogin(pending, logins, req.ip ?? 'unknown', requested);
     switch (outcome.kind) {
       case 'redirect':
         res.set('Cache-Control', 'no-store').redirect(302, outcome.location);
@@ -104,7 +111,9 @@ export function createApp({
       sender,
       audit,
       scopes: (req.auth?.scopes ?? []).filter(isScope),
-      credentialsFor: auth => provider.credentialsFor(auth),
+      credentialsFor: (auth, account) => provider.credentialsFor(auth, account),
+      accountsFor: auth => provider.accountsFor(auth),
+      canSend: user => provider.canSend(user),
       revokeGrant: id => provider.revokeGrant(id),
     });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });

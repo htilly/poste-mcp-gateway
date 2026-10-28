@@ -1,8 +1,8 @@
 {
   "name": "poste-mcp-gateway",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "MCP gateway into poste.io mailboxes: users sign in with their own IMAP account over OAuth 2.1; read always, organize and send opt-in.",
+  "description": "MCP gateway into poste.io mailboxes: users sign in with their own IMAP accounts (one or several) over OAuth 2.1; read always, organize and send opt-in.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

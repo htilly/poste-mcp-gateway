@@ -47,9 +47,12 @@ const sender = new MailSender(
 const app = createApp({ provider, reader, writer, sender, publicUrl: config.publicUrl, resourceUrl, version, audit });
 
 store.pruneExpiredGrants();
-// Removing an address from ALLOWED_USERS and restarting is how access is revoked.
-const revoked = store.deleteGrantsWhere(g => !config.allowedUsers.has(g.user));
-if (revoked) console.error(`[gateway] revoked ${revoked} grant(s) for addresses no longer allowed`);
+// Removing an address from ALLOWED_USERS and restarting is how access is revoked:
+// the mailbox leaves every grant, and grants whose primary mailbox it was are deleted.
+const pruned = store.pruneAccounts(user => config.allowedUsers.has(user));
+if (pruned.accounts || pruned.grants) {
+  audit('accounts_pruned', { removedMailboxes: pruned.accounts, removedGrants: pruned.grants, reason: 'not in ALLOWED_USERS' });
+}
 setInterval(() => store.pruneExpiredGrants(), 6 * 3600 * 1000).unref();
 
 const server = app.listen(config.listenPort, config.listenHost, () => {

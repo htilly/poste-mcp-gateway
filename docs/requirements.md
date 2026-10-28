@@ -7,7 +7,8 @@ sharing one self-hosted mail server) a way to let Claude work with their own
 mail. Each person adds the gateway as a custom MCP connector in Claude
 (claude.ai, Claude Desktop, mobile), signs in once with their normal
 poste.io address and password, and from then on Claude can search and read
-that person's mailbox, and only that mailbox. Organizing and sending are
+that person's mailboxes (one or several of their own), and only those.
+Organizing and sending are
 opt-in, per person, and bounded by the server rather than by Claude's
 judgment.
 
@@ -18,8 +19,11 @@ judgment.
 - **R2. Identity is the mailbox.** A user proves who they are by logging in
   to poste.io over IMAP with their own credentials. A successful IMAP login is
   the only way to obtain access.
-- **R3. Isolation between users.** A user can only ever reach the mailbox they
-  signed in with. Nothing in a request can select another user's mailbox.
+- **R3. Isolation between users.** A connection can only ever reach the
+  mailboxes signed in to when it was created, each proven by its own IMAP
+  login and on the allowlist. Nothing in a request can select a mailbox
+  outside that set. A person may connect several of their own mailboxes;
+  one failed mailbox fails the whole sign-in.
 - **R4. Revocation.** A user (or the admin) can revoke access; revoking deletes
   the stored credential. A changed poste.io password invalidates access, and
   the user must sign in again. Grants end after a maximum age, and a replayed
@@ -103,7 +107,6 @@ judgment.
 - Users outside the allowlist, self-service sign-up, other mail providers.
 - Passkeys. Planned as a later step: after the first IMAP sign-in, a user can
   register a passkey and use it for later authorizations.
-- Several mailboxes in one connection (planned next).
 - Full-text search beyond what IMAP `SEARCH` provides (no local index or
   mirror of mail).
 
@@ -119,4 +122,5 @@ judgment.
   enforced by tests.
 - A request to send or forward to an address the mailbox has never mailed
   ends up in Drafts, not in the recipient's inbox.
-- Two users signed in at once only ever see their own mail.
+- Two users signed in at once only ever see their own mail, and a
+  connection with several mailboxes reaches exactly those mailboxes.

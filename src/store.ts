@@ -2,15 +2,23 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 
+/** One mailbox in a grant: proven by an IMAP login, its password sealed for that address only. */
+export interface GrantAccount {
+  user: string;
+  sealedPassword: string;
+}
+
 /**
- * One user's consent to one OAuth client. Holds the user's IMAP password,
- * sealed; deleting the grant is how access is revoked.
+ * One person's consent to one OAuth client, covering one or more of their
+ * own mailboxes. Holds the sealed IMAP passwords; deleting the grant is how
+ * access is revoked.
  */
 export interface Grant {
   id: string;
+  /** The primary mailbox: the first one signed in, and the default for tools. */
   user: string;
+  accounts: GrantAccount[];
   clientId: string;
-  sealedPassword: string;
   scopes: string[];
   resource?: string;
   refreshHash: string;
@@ -22,7 +30,7 @@ export interface Grant {
 }
 
 interface StateFile {
-  version: 1;
+  version: 2;
   clients: Record<string, OAuthClientInformationFull>;
   grants: Record<string, Grant>;
 }
@@ -45,13 +53,23 @@ export class Store {
 
   private static load(path: string): StateFile {
     try {
-      const parsed = JSON.parse(readFileSync(path, 'utf8')) as StateFile;
-      if (parsed.version !== 1) throw new Error(`unsupported state version ${parsed.version}`);
-      return parsed;
+      return Store.migrate(JSON.parse(readFileSync(path, 'utf8')));
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, clients: {}, grants: {} };
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { version: 2, clients: {}, grants: {} };
       throw err;
     }
+  }
+
+  /** Version 1 grants held a single mailbox (user + sealedPassword); version 2 holds a list. */
+  private static migrate(raw: { version: number; clients: StateFile['clients']; grants: Record<string, Record<string, unknown>> }): StateFile {
+    if (raw.version === 2) return raw as unknown as StateFile;
+    if (raw.version !== 1) throw new Error(`unsupported state version ${raw.version}`);
+    const grants: Record<string, Grant> = {};
+    for (const [id, g] of Object.entries(raw.grants)) {
+      const { sealedPassword, ...rest } = g as unknown as Grant & { sealedPassword: string };
+      grants[id] = { ...rest, accounts: [{ user: rest.user, sealedPassword }] };
+    }
+    return { version: 2, clients: raw.clients, grants };
   }
 
   private save(): void {
@@ -125,12 +143,26 @@ export class Store {
     return Object.values(this.state.grants);
   }
 
-  /** Drops every grant matching `predicate`. Returns how many went. */
-  deleteGrantsWhere(predicate: (grant: Grant) => boolean): number {
-    const doomed = Object.values(this.state.grants).filter(predicate);
-    for (const grant of doomed) delete this.state.grants[grant.id];
-    if (doomed.length) this.save();
-    return doomed.length;
+  /**
+   * Removes mailboxes that are no longer allowed from every grant. A grant
+   * whose primary mailbox is removed is deleted outright, since it was that
+   * sign-in that created it.
+   */
+  pruneAccounts(allowed: (user: string) => boolean): { accounts: number; grants: number } {
+    let accounts = 0;
+    let grants = 0;
+    for (const grant of Object.values(this.state.grants)) {
+      if (!allowed(grant.user)) {
+        delete this.state.grants[grant.id];
+        grants++;
+        continue;
+      }
+      const kept = grant.accounts.filter(a => allowed(a.user));
+      accounts += grant.accounts.length - kept.length;
+      grant.accounts = kept;
+    }
+    if (accounts || grants) this.save();
+    return { accounts, grants };
   }
 
   /** Drops grants whose refresh token has expired. Returns how many went. */

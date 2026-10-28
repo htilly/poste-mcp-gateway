@@ -3,7 +3,8 @@
 An MCP gateway into poste.io mailboxes. A small, invited group of mailbox
 owners add `https://mail.example.com/mcp` as a custom connector in Claude,
 sign in once with their own poste.io address and password, and Claude can
-then work with **their** mailbox. Reading is always allowed; organizing
+then work with **their** mailboxes (up to three of their own in one
+connection). Reading is always allowed; organizing
 (flags, moves, Trash, drafts) and sending are separate permissions each
 user ticks at sign-in, and sending must also be enabled per address by the
 administrator.
@@ -25,9 +26,14 @@ Claude ──HTTPS :443──▶ reverse proxy ──▶ gateway :8080 ──IMA
   `mail.modify` and `mail.send` only if ticked (send only for addresses in
   `SEND_USERS`). Tools for scopes a grant lacks are never registered, and
   scopes are re-checked against current configuration on every request.
-- **One grant per user and client.** The user's IMAP password is sealed with
-  AES-256-GCM (key from a Docker secret, bound to the user) and stored with
-  the grant. Tokens are stored hashed. Access tokens live 1 hour in memory;
+- **Several of your own mailboxes per connection.** The sign-in page takes
+  the primary mailbox plus up to two more. Each one must be on the allowlist
+  and is proven by logging in to it; if any fails, the whole sign-in fails.
+  Every tool takes an optional `account` (default: the primary); a mailbox
+  outside the grant is unreachable.
+- **One grant per sign-in and client.** Each mailbox's IMAP password is
+  sealed with AES-256-GCM (key from a mounted file, bound to that address)
+  and stored with the grant. Tokens are stored hashed. Access tokens live 1 hour in memory;
   refresh tokens rotate on every use, slide 30 days, and grants end after
   90 days regardless. Replaying a rotated refresh token revokes the grant.
 - **Every tool call opens a short IMAP session as that user.** Reads use
@@ -44,6 +50,7 @@ supplies the provider (`src/provider.ts`).
 
 | Tool | Scope | Does |
 |---|---|---|
+| `list_accounts` | read | The mailboxes in this connection, which is the default, and which may send |
 | `list_folders` | read | Folders with message and unread counts |
 | `search_mail` | read | IMAP SEARCH in one folder (text, from, to, subject, since, before, unseen), newest first, max 50 |
 | `read_message` | read | Headers, body as text/Markdown (20k chars max), attachment list |
@@ -54,6 +61,9 @@ supplies the provider (`src/provider.ts`).
 | `trash_messages` | modify | Move to Trash. Permanent deletion does not exist |
 | `save_draft` | modify | New message, reply, reply-all or forward, saved to Drafts |
 | `send_message`, `reply_to_message`, `forward_message` | send | Send as the signed-in address via poste.io SMTP, copy kept in Sent |
+
+All tools except `list_accounts` take an optional `account` (an address
+from `list_accounts`). Send permission is checked per mailbox.
 
 Everything a message's sender wrote (subjects, addresses, filenames, bodies,
 attachment text) is returned inside `<<<UNTRUSTED EMAIL CONTENT ...>>>`
@@ -115,7 +125,9 @@ puts the limits in the server:
 - A user: disconnect the connector in Claude (calls the revocation endpoint).
 - An admin: remove the address from `ALLOWED_USERS` and restart; grants for
   addresses no longer allowed are deleted at startup. Removing an address
-  from `SEND_USERS` takes send away on the next request.
+  from `SEND_USERS` takes send away on the next request. An address removed
+  from `ALLOWED_USERS` also leaves every connection it was added to; a
+  connection whose primary mailbox it was is deleted.
 - Everyone at once: replace the vault key and delete the state file.
 
 ## Configuration
