@@ -21,9 +21,14 @@ export interface Config {
   smtpPort: number;
   /** Implicit TLS (port 465). Otherwise STARTTLS is required. */
   smtpSecure: boolean;
-  /** Addresses that may be granted mail.send. Defaults to every allowed user. */
+  /** Addresses that may hold mail.send. Empty by default: sending is opt-in per address. */
   sendUsers: Set<string>;
   sendLimitPerHour: number;
+  /** "draft" (default): mail to never-before-mailed recipients goes to Drafts. "allow": send anyway. */
+  sendNewRecipients: 'draft' | 'allow';
+  /** Hosts an OAuth client may redirect to (https). Loopback http is always allowed for desktop clients. */
+  allowedRedirectHosts: Set<string>;
+  maxGrantAgeSec: number;
   accessTokenTtlSec: number;
   refreshTokenTtlSec: number;
 }
@@ -51,6 +56,35 @@ export function parseAllowedUsers(raw: string): Set<string> {
   return new Set(users);
 }
 
+function parseNewRecipientPolicy(raw: string | undefined): 'draft' | 'allow' {
+  const v = (raw ?? 'draft').trim().toLowerCase();
+  if (v !== 'draft' && v !== 'allow') throw new Error('SEND_NEW_RECIPIENTS must be "draft" or "allow"');
+  return v;
+}
+
+export function parseHosts(raw: string): Set<string> {
+  return new Set(raw.split(',').map(h => h.trim().toLowerCase()).filter(Boolean));
+}
+
+/**
+ * Whether an OAuth client may register this redirect URI: https to an
+ * allowed host (or a subdomain of one), or http to a loopback address
+ * (RFC 8252, desktop clients such as Claude Code).
+ */
+export function isAllowedRedirectUri(uri: string, hosts: Set<string>): boolean {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password) return false;
+  const host = url.hostname.toLowerCase();
+  if (url.protocol === 'http:') return host === '127.0.0.1' || host === '[::1]' || host === 'localhost';
+  if (url.protocol !== 'https:') return false;
+  return [...hosts].some(h => host === h || host.endsWith(`.${h}`));
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const keyFile = env.VAULT_KEY_FILE?.trim();
   const vaultKey = parseVaultKey(keyFile ? readFileSync(keyFile, 'utf8') : required(env, 'VAULT_KEY'));
@@ -58,7 +92,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const publicUrl = new URL(required(env, 'PUBLIC_URL'));
   const imapHost = required(env, 'IMAP_HOST');
   const allowedUsers = parseAllowedUsers(required(env, 'ALLOWED_USERS'));
-  const sendUsers = env.SEND_USERS?.trim() ? parseAllowedUsers(env.SEND_USERS) : new Set(allowedUsers);
+  const sendUsers = env.SEND_USERS?.trim() ? parseAllowedUsers(env.SEND_USERS) : new Set<string>();
   for (const user of sendUsers) {
     if (!allowedUsers.has(user)) throw new Error(`SEND_USERS lists ${user}, which is not in ALLOWED_USERS`);
   }
@@ -78,7 +112,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smtpPort,
     smtpSecure: env.SMTP_SECURE ? env.SMTP_SECURE === 'true' : smtpPort === 465,
     sendUsers,
-    sendLimitPerHour: Number(env.SEND_LIMIT_PER_HOUR ?? 20),
+    sendLimitPerHour: Number(env.SEND_LIMIT_PER_HOUR ?? 10),
+    sendNewRecipients: parseNewRecipientPolicy(env.SEND_NEW_RECIPIENTS),
+    allowedRedirectHosts: parseHosts(env.ALLOWED_REDIRECT_HOSTS ?? 'claude.ai,claude.com'),
+    maxGrantAgeSec: Number(env.MAX_GRANT_AGE_DAYS ?? 90) * 24 * 3600,
     accessTokenTtlSec: Number(env.ACCESS_TOKEN_TTL ?? 3600),
     refreshTokenTtlSec: Number(env.REFRESH_TOKEN_TTL ?? 30 * 24 * 3600),
   };

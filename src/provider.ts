@@ -9,10 +9,10 @@ import type {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import {
+  InvalidClientMetadataError,
   InvalidGrantError,
   InvalidTargetError,
   InvalidTokenError,
-  TooManyRequestsError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { Vault, hashToken, newToken } from './crypto.js';
 import type { Grant, Store } from './store.js';
@@ -20,16 +20,23 @@ import { LoginGuard } from './login-guard.js';
 import type { ImapCredentials, LoginResult } from './imap.js';
 import { LOGIN_PAGE_CSP, renderLoginPage } from './login-page.js';
 import { SCOPES, type Scope } from './scopes.js';
+import { silentAudit, type Audit } from './audit.js';
 
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
 /** How long a finished sign-in answers a duplicate submit with the same redirect. */
 const REPLAY_TTL_MS = 60 * 1000;
 
+/** One answer for every refused sign-in, so the page reveals neither the allowlist nor lock state. */
+const SIGN_IN_FAILED =
+  'Sign-in failed. Check the address and password. After several failed attempts, sign-in pauses for 15 minutes.';
+
 interface PendingAuthorization {
   clientId: string;
   params: AuthorizationParams;
   expiresAt: number;
+  /** Set while its IMAP check runs, so the same form cannot be raced in parallel. */
+  busy?: boolean;
 }
 
 interface AuthCode {
@@ -63,10 +70,19 @@ export interface ProviderOptions {
   /** The MCP endpoint URL; the only acceptable RFC 8707 resource. */
   resourceUrl: URL;
   verifyLogin: (creds: ImapCredentials) => Promise<LoginResult>;
-  /** Whether this (normalized) address may be granted mail.send. */
+  /** Whether this (normalized) address may currently hold mail.send. Re-checked on every token. */
   canSend: (user: string) => boolean;
+  /**
+   * Whether a client redirect URI may be registered. Dynamic registration is
+   * unauthenticated, so this is what stops a stranger's "client" from
+   * collecting authorization codes through the genuine sign-in page.
+   */
+  allowRedirectUri: (uri: string) => boolean;
   accessTokenTtlSec: number;
   refreshTokenTtlSec: number;
+  /** Absolute grant lifetime; refreshing never extends a grant past this. */
+  maxGrantAgeSec: number;
+  audit?: Audit;
   now?: () => number;
 }
 
@@ -101,25 +117,38 @@ export class GatewayProvider implements OAuthServerProvider {
   private readonly completed = new Map<string, CompletedSignIn>();
   private readonly access = new Map<string, AccessEntry>();
   private readonly now: () => number;
+  private readonly audit: Audit;
 
   constructor(private readonly opts: ProviderOptions) {
     this.now = opts.now ?? Date.now;
+    this.audit = opts.audit ?? silentAudit;
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
-    const { store } = this.opts;
+    const { store, allowRedirectUri } = this.opts;
     return {
       getClient: id => store.getClient(id),
       registerClient: client => {
         const full = client as OAuthClientInformationFull;
-        try {
-          store.addClient(full);
-        } catch {
-          throw new TooManyRequestsError('client registration limit reached');
+        const refused = full.redirect_uris.filter(uri => !allowRedirectUri(String(uri)));
+        if (refused.length) {
+          this.audit('client_refused', { redirectUris: refused.map(String) });
+          throw new InvalidClientMetadataError('redirect_uri not allowed on this server');
         }
+        store.addClient(full);
+        this.audit('client_registered', { clientId: full.client_id, clientName: full.client_name });
         return full;
       },
     };
+  }
+
+  /**
+   * The scopes a grant may use right now: what was granted at sign-in,
+   * narrowed by current policy (an address removed from SEND_USERS loses
+   * mail.send on its next request, not when it next signs in).
+   */
+  private effectiveScopes(grant: Grant): Scope[] {
+    return grant.scopes.filter(s => s !== SCOPES.send || this.opts.canSend(grant.user)) as Scope[];
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
@@ -172,17 +201,22 @@ export class GatewayProvider implements OAuthServerProvider {
     });
 
     const account = LoginGuard.normalize(user);
+    if (!password || pending.busy) return retry(401, SIGN_IN_FAILED);
     const decision = this.opts.guard.check(account, ip);
-    if (!decision.ok) {
-      if (decision.reason === 'not_allowed') return retry(401, 'Wrong address or password.');
-      return retry(429, 'Too many failed sign-ins. Try again in 15 minutes.');
-    }
-    if (!password) return retry(401, 'Wrong address or password.');
+    if (!decision.ok) return retry(401, SIGN_IN_FAILED);
 
-    const result = await this.opts.verifyLogin({ user: account, password });
+    // The guard reserved this attempt; settle it whatever happens.
+    pending.busy = true;
+    let result: LoginResult = 'unavailable';
+    try {
+      result = await this.opts.verifyLogin({ user: account, password });
+    } finally {
+      pending.busy = false;
+      if (result === 'unavailable') this.opts.guard.release(account, ip);
+      else this.opts.guard.record(account, ip, result === 'ok');
+    }
     if (result === 'unavailable') return retry(503, 'The mail server could not be reached. Try again shortly.');
-    this.opts.guard.record(account, ip, result === 'ok');
-    if (result !== 'ok') return retry(401, 'Wrong address or password.');
+    if (result !== 'ok') return retry(401, SIGN_IN_FAILED);
 
     // Read is always granted; modify and send only when ticked, and send only
     // for addresses allowed to send. Anything else in the form is ignored.
@@ -204,6 +238,7 @@ export class GatewayProvider implements OAuthServerProvider {
     location.searchParams.set('code', code);
     if (pending.params.state !== undefined) location.searchParams.set('state', pending.params.state);
     this.completed.set(pendingId, { user: account, location: location.href, expiresAt: this.now() + REPLAY_TTL_MS });
+    this.audit('sign_in', { user: account, ip, clientId: client.client_id, clientName: client.client_name, scopes });
     return { kind: 'redirect', location: location.href };
   }
 
@@ -252,12 +287,18 @@ export class GatewayProvider implements OAuthServerProvider {
       scopes: entry.scopes,
       resource: grantResource,
       refreshHash: hashToken(refreshToken),
-      refreshExpiresAt: now + this.opts.refreshTokenTtlSec * 1000,
+      refreshExpiresAt: this.refreshExpiry(now, now),
       createdAt: now,
       lastUsedAt: now,
     };
     this.opts.store.putGrant(grant);
+    this.audit('grant_created', { user: grant.user, grantId: grant.id, clientId: grant.clientId, scopes: grant.scopes });
     return this.issue(grant, refreshToken);
+  }
+
+  /** Sliding refresh expiry, capped by the grant's absolute lifetime. */
+  private refreshExpiry(createdAt: number, now: number): number {
+    return Math.min(now + this.opts.refreshTokenTtlSec * 1000, createdAt + this.opts.maxGrantAgeSec * 1000);
   }
 
   async exchangeRefreshToken(
@@ -266,7 +307,15 @@ export class GatewayProvider implements OAuthServerProvider {
     _scopes?: string[],
     resource?: URL,
   ): Promise<OAuthTokens> {
-    const grant = this.opts.store.findGrantByRefreshHash(hashToken(refreshToken));
+    const hash = hashToken(refreshToken);
+    // A refresh token that was already rotated away is being replayed: either
+    // the client misbehaves or the token leaked. Revoke the grant either way.
+    const replayed = this.opts.store.findGrantByPreviousRefreshHash(hash);
+    if (replayed) {
+      this.revokeGrant(replayed.id, 'refresh_token_reuse');
+      throw new InvalidGrantError('refresh token reuse detected; sign in again');
+    }
+    const grant = this.opts.store.findGrantByRefreshHash(hash);
     if (!grant || grant.clientId !== client.client_id || grant.refreshExpiresAt <= this.now()) {
       throw new InvalidGrantError('invalid or expired refresh token');
     }
@@ -276,21 +325,24 @@ export class GatewayProvider implements OAuthServerProvider {
     // Rotate: the presented refresh token is dead from here on.
     const next = newToken();
     const now = this.now();
-    this.opts.store.putGrant({
+    const updated: Grant = {
       ...grant,
+      previousRefreshHash: grant.refreshHash,
       refreshHash: hashToken(next),
-      refreshExpiresAt: now + this.opts.refreshTokenTtlSec * 1000,
+      refreshExpiresAt: this.refreshExpiry(grant.createdAt, now),
       lastUsedAt: now,
-    });
-    return this.issue(grant, next);
+    };
+    this.opts.store.putGrant(updated);
+    return this.issue(updated, next);
   }
 
   private issue(grant: Grant, refreshToken: string): OAuthTokens {
     const accessToken = newToken();
+    const scopes = this.effectiveScopes(grant);
     this.access.set(hashToken(accessToken), {
       grantId: grant.id,
       clientId: grant.clientId,
-      scopes: grant.scopes,
+      scopes,
       resource: grant.resource,
       expiresAt: this.now() + this.opts.accessTokenTtlSec * 1000,
     });
@@ -299,21 +351,23 @@ export class GatewayProvider implements OAuthServerProvider {
       token_type: 'Bearer',
       expires_in: this.opts.accessTokenTtlSec,
       refresh_token: refreshToken,
-      scope: grant.scopes.join(' '),
+      scope: scopes.join(' '),
     };
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const key = hashToken(token);
     const entry = this.access.get(key);
-    if (!entry || entry.expiresAt <= this.now() || !this.opts.store.getGrant(entry.grantId)) {
+    const grant = entry && this.opts.store.getGrant(entry.grantId);
+    if (!entry || !grant || entry.expiresAt <= this.now()) {
       this.access.delete(key);
       throw new InvalidTokenError('invalid or expired access token');
     }
+    const allowed = this.effectiveScopes(grant);
     return {
       token,
       clientId: entry.clientId,
-      scopes: entry.scopes,
+      scopes: entry.scopes.filter(s => (allowed as string[]).includes(s)),
       expiresAt: Math.floor(entry.expiresAt / 1000),
       resource: new URL(entry.resource ?? this.opts.resourceUrl.href),
       extra: { grantId: entry.grantId },
@@ -328,12 +382,14 @@ export class GatewayProvider implements OAuthServerProvider {
       return;
     }
     const grant = this.opts.store.findGrantByRefreshHash(hash);
-    if (grant && grant.clientId === client.client_id) this.revokeGrant(grant.id);
+    if (grant && grant.clientId === client.client_id) this.revokeGrant(grant.id, 'client_revoked');
   }
 
   /** Deletes a grant and every access token minted from it. */
-  revokeGrant(grantId: string): void {
+  revokeGrant(grantId: string, reason = 'revoked'): void {
+    const grant = this.opts.store.getGrant(grantId);
     this.opts.store.deleteGrant(grantId);
+    if (grant) this.audit('grant_revoked', { user: grant.user, grantId, reason });
     for (const [key, entry] of this.access) if (entry.grantId === grantId) this.access.delete(key);
   }
 
@@ -381,7 +437,7 @@ function sendLoginPage(
       renderLoginPage({
         pendingId: view.pendingId,
         clientName: view.client.client_name ?? 'An MCP client',
-        redirectHost: new URL(view.params.redirectUri).host,
+        redirectUri: view.params.redirectUri,
         message: view.message,
         requested: view.requested ?? [],
       }),

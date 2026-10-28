@@ -1,4 +1,5 @@
 import express, { type Express } from 'express';
+import { rateLimit } from 'express-rate-limit';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
@@ -9,6 +10,7 @@ import type { MailReader } from './mail.js';
 import type { MailWriter } from './mail-write.js';
 import type { MailSender } from './smtp.js';
 import { ALL_SCOPES, SCOPES, isScope, type Scope } from './scopes.js';
+import { silentAudit, type Audit } from './audit.js';
 
 export interface AppDeps {
   provider: GatewayProvider;
@@ -20,14 +22,34 @@ export interface AppDeps {
   /** The MCP endpoint, publicUrl + /mcp */
   resourceUrl: URL;
   version: string;
+  audit?: Audit;
+  /** POST /login requests per IP per 15 minutes. */
+  loginRateLimit?: number;
 }
 
-export function createApp({ provider, reader, writer, sender, publicUrl, resourceUrl, version }: AppDeps): Express {
+export function createApp({
+  provider,
+  reader,
+  writer,
+  sender,
+  publicUrl,
+  resourceUrl,
+  version,
+  audit = silentAudit,
+  loginRateLimit = 20,
+}: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
   // Exactly one reverse proxy sits in front; req.ip is then the real client,
   // which the login guard and the SDK's rate limiters key on.
   app.set('trust proxy', 1);
+
+  if (publicUrl.protocol === 'https:') {
+    app.use((_req, res, next) => {
+      res.set('Strict-Transport-Security', 'max-age=31536000');
+      next();
+    });
+  }
 
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true });
@@ -43,7 +65,10 @@ export function createApp({ provider, reader, writer, sender, publicUrl, resourc
     }),
   );
 
-  app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
+  // Coarse request cap in front of the login guard's own accounting.
+  const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: loginRateLimit, standardHeaders: 'draft-7', legacyHeaders: false });
+
+  app.post('/login', loginLimiter, express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
     const pending = String(req.body?.pending ?? '');
     const user = String(req.body?.user ?? '');
     const password = String(req.body?.password ?? '');
@@ -54,7 +79,7 @@ export function createApp({ provider, reader, writer, sender, publicUrl, resourc
         res.set('Cache-Control', 'no-store').redirect(302, outcome.location);
         return;
       case 'retry':
-        console.error(`[login] refused user=${user.trim().toLowerCase()} ip=${req.ip} status=${outcome.status}`);
+        audit('sign_in_refused', { user: user.trim().toLowerCase().slice(0, 254), ip: req.ip, status: outcome.status });
         provider.renderRetry(res, outcome);
         return;
       case 'expired':
@@ -77,6 +102,7 @@ export function createApp({ provider, reader, writer, sender, publicUrl, resourc
       reader,
       writer,
       sender,
+      audit,
       scopes: (req.auth?.scopes ?? []).filter(isScope),
       credentialsFor: auth => provider.credentialsFor(auth),
       revokeGrant: id => provider.revokeGrant(id),

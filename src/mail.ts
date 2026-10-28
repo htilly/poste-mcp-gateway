@@ -68,14 +68,33 @@ export interface SearchQuery {
 const addr = (list?: { address?: string; name?: string }[]) =>
   list?.map(a => (a.name ? `${a.name} <${a.address}>` : a.address)).join(', ') || undefined;
 
+/** Sender-written header values are capped so one message cannot flood a result. */
+const clip = (s: string | undefined, max: number) => (s && s.length > max ? `${s.slice(0, max)}…` : s);
+
+/**
+ * Fetches a message's source only after its size is known to be within
+ * bounds. Parsing happens fully in memory, so an oversized inbound message
+ * must be refused before it is downloaded, not after.
+ */
+async function fetchBoundedSource(client: ImapFlow, uid: number, folder: string, extra: { envelope?: boolean; flags?: boolean } = {}) {
+  const head = await client.fetchOne(String(uid), { uid: true, size: true }, { uid: true });
+  if (!head) throw new Error(`no message with UID ${uid} in ${folder}`);
+  if ((head.size ?? 0) > LIMITS.rawSourceBytes) {
+    throw new Error(`message is ${head.size} bytes; this gateway reads messages up to ${LIMITS.rawSourceBytes} bytes`);
+  }
+  const msg = await client.fetchOne(String(uid), { uid: true, size: true, source: true, ...extra }, { uid: true });
+  if (!msg || !msg.source) throw new Error(`no message with UID ${uid} in ${folder}`);
+  return msg;
+}
+
 function summarize(msg: FetchMessageObject): MessageSummary {
   const flags = msg.flags ?? new Set<string>();
   return {
     uid: msg.uid,
     date: msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : undefined,
-    from: addr(msg.envelope?.from),
-    to: addr(msg.envelope?.to),
-    subject: msg.envelope?.subject,
+    from: clip(addr(msg.envelope?.from), 500),
+    to: clip(addr(msg.envelope?.to), 1000),
+    subject: clip(msg.envelope?.subject, 300),
     seen: flags.has('\\Seen'),
     flagged: flags.has('\\Flagged'),
     size: msg.size,
@@ -143,22 +162,21 @@ export class MailReader {
 
   async getMessage(creds: ImapCredentials, folder: string, uid: number): Promise<MessageView> {
     return withMailbox(this.target, creds, folder, async client => {
-      const msg = await client.fetchOne(String(uid), { uid: true, envelope: true, flags: true, size: true, source: true }, { uid: true });
-      if (!msg || !msg.source) throw new Error(`no message with UID ${uid} in ${folder}`);
-      const parsed = await simpleParser(msg.source);
+      const msg = await fetchBoundedSource(client, uid, folder, { envelope: true, flags: true });
+      const parsed = await simpleParser(msg.source!);
       const body = bodyOf(parsed);
       return {
         ...summarize(msg),
         folder,
-        cc: parsed.cc ? [parsed.cc].flat().map(a => a.text).join(', ') : undefined,
-        replyTo: parsed.replyTo?.text,
+        cc: clip(parsed.cc ? [parsed.cc].flat().map(a => a.text).join(', ') : undefined, 1000),
+        replyTo: clip(parsed.replyTo?.text, 500),
         messageId: parsed.messageId,
         inReplyTo: parsed.inReplyTo,
         body: body.slice(0, LIMITS.bodyChars),
         bodyTruncated: body.length > LIMITS.bodyChars,
         attachments: parsed.attachments.map((a, index) => ({
           index,
-          filename: a.filename,
+          filename: clip(a.filename, 200),
           contentType: a.contentType,
           size: a.size,
         })),
@@ -173,9 +191,8 @@ export class MailReader {
     index: number,
   ): Promise<{ filename?: string; contentType: string; size: number; content: Buffer }> {
     return withMailbox(this.target, creds, folder, async client => {
-      const msg = await client.fetchOne(String(uid), { uid: true, source: true }, { uid: true });
-      if (!msg || !msg.source) throw new Error(`no message with UID ${uid} in ${folder}`);
-      const parsed = await simpleParser(msg.source);
+      const msg = await fetchBoundedSource(client, uid, folder);
+      const parsed = await simpleParser(msg.source!);
       const att = parsed.attachments[index];
       if (!att) throw new Error(`message ${uid} has no attachment #${index}`);
       if (att.size > LIMITS.attachmentBytes) {
@@ -185,15 +202,52 @@ export class MailReader {
     });
   }
 
+  /**
+   * Which of `addresses` this mailbox has sent mail to before (To, Cc or Bcc
+   * of a message in Sent). IMAP SEARCH matches substrings, so hits are
+   * confirmed against the exact envelope addresses.
+   *
+   * "Has mailed me" would be useless here: a prompt-injection email arrives
+   * from exactly the address it wants data sent to. Sent history is under
+   * the user's control.
+   */
+  async previouslySentTo(creds: ImapCredentials, addresses: string[]): Promise<Set<string>> {
+    const wanted = [...new Set(addresses.map(a => a.toLowerCase()))];
+    const known = new Set<string>();
+    if (wanted.length === 0) return known;
+    const sent = await withClient(this.target, creds, async client => {
+      const folders = await client.list();
+      return (
+        folders.find(f => f.specialUse === '\\Sent') ??
+        folders.find(f => ['sent', 'sent messages', 'sent items'].includes(f.path.toLowerCase()))
+      )?.path;
+    });
+    if (!sent) return known;
+    return withMailbox(this.target, creds, sent, async client => {
+      for (const addr of wanted) {
+        const hits = new Set<number>();
+        for (const field of ['to', 'cc', 'bcc'] as const) {
+          for (const uid of (await client.search({ [field]: addr }, { uid: true })) || []) hits.add(uid);
+        }
+        const recent = [...hits].sort((a, b) => b - a).slice(0, 20);
+        if (recent.length === 0) continue;
+        for await (const msg of client.fetch(recent, { uid: true, envelope: true }, { uid: true })) {
+          const env = msg.envelope;
+          const all = [...(env?.to ?? []), ...(env?.cc ?? []), ...(env?.bcc ?? [])];
+          if (all.some(a => a.address?.toLowerCase() === addr)) {
+            known.add(addr);
+            break;
+          }
+        }
+      }
+      return known;
+    });
+  }
+
   /** The raw RFC 5322 source of one message, for replying to or forwarding it. */
   async getRawSource(creds: ImapCredentials, folder: string, uid: number): Promise<Buffer> {
     return withMailbox(this.target, creds, folder, async client => {
-      const msg = await client.fetchOne(String(uid), { uid: true, size: true, source: true }, { uid: true });
-      if (!msg || !msg.source) throw new Error(`no message with UID ${uid} in ${folder}`);
-      if ((msg.size ?? msg.source.length) > LIMITS.rawSourceBytes) {
-        throw new Error(`message is ${msg.size} bytes; the limit for reply/forward is ${LIMITS.rawSourceBytes}`);
-      }
-      return msg.source;
+      return (await fetchBoundedSource(client, uid, folder)).source!;
     });
   }
 

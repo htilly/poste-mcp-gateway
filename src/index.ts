@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { loadConfig } from './config.js';
+import { isAllowedRedirectUri, loadConfig } from './config.js';
 import { Vault } from './crypto.js';
 import { Store } from './store.js';
 import { LoginGuard } from './login-guard.js';
@@ -7,6 +7,7 @@ import { GatewayProvider } from './provider.js';
 import { MailReader } from './mail.js';
 import { MailWriter } from './mail-write.js';
 import { MailSender } from './smtp.js';
+import { audit } from './audit.js';
 import { verifyLogin, type ImapTarget } from './imap.js';
 import { createApp } from './server.js';
 
@@ -24,17 +25,26 @@ const provider = new GatewayProvider({
   resourceUrl,
   verifyLogin: creds => verifyLogin(target, creds),
   canSend: user => config.sendUsers.has(user),
+  allowRedirectUri: uri => isAllowedRedirectUri(uri, config.allowedRedirectHosts),
+  maxGrantAgeSec: config.maxGrantAgeSec,
+  audit,
   accessTokenTtlSec: config.accessTokenTtlSec,
   refreshTokenTtlSec: config.refreshTokenTtlSec,
 });
 
+const reader = new MailReader(target);
 const writer = new MailWriter(target);
 const sender = new MailSender(
   { host: config.smtpHost, port: config.smtpPort, secure: config.smtpSecure, servername: config.smtpHost },
   writer,
-  config.sendLimitPerHour,
+  {
+    perHour: config.sendLimitPerHour,
+    newRecipients: config.sendNewRecipients,
+    previouslySentTo: (creds, addresses) => reader.previouslySentTo(creds, addresses),
+  },
+  audit,
 );
-const app = createApp({ provider, reader: new MailReader(target), writer, sender, publicUrl: config.publicUrl, resourceUrl, version });
+const app = createApp({ provider, reader, writer, sender, publicUrl: config.publicUrl, resourceUrl, version, audit });
 
 store.pruneExpiredGrants();
 // Removing an address from ALLOWED_USERS and restarting is how access is revoked.

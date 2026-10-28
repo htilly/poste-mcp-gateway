@@ -22,9 +22,12 @@ export class Vault {
   open(sealed: string, aad: string): string {
     const [version, iv, tag, ct] = sealed.split('.');
     if (version !== 'v1' || !iv || !tag || ct === undefined) throw new Error('malformed sealed value');
-    const decipher = createDecipheriv('aes-256-gcm', this.key, Buffer.from(iv, 'base64url'));
+    const authTag = Buffer.from(tag, 'base64url');
+    // Node accepts truncated GCM tags unless told otherwise; only full 16-byte tags are valid here.
+    if (authTag.length !== 16) throw new Error('malformed sealed value');
+    const decipher = createDecipheriv('aes-256-gcm', this.key, Buffer.from(iv, 'base64url'), { authTagLength: 16 });
     decipher.setAAD(Buffer.from(aad, 'utf8'));
-    decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+    decipher.setAuthTag(authTag);
     return Buffer.concat([decipher.update(Buffer.from(ct, 'base64url')), decipher.final()]).toString('utf8');
   }
 }

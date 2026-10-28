@@ -4,7 +4,8 @@ import { SCOPES, type Scope } from './scopes.js';
 export interface LoginView {
   pendingId: string;
   clientName: string;
-  redirectHost: string;
+  /** Where the authorization code goes. Shown in full: it is the real identity of the client. */
+  redirectUri: string;
   message?: string;
   /** Scopes ticked on a previous attempt, so a retry keeps the choice. */
   requested?: Scope[];
@@ -68,12 +69,14 @@ export function renderLoginPage(view: LoginView): string {
   .opt small { display: block; color: var(--muted); }
   .error { color: var(--err); }
   .note { font-size: .85rem; }
+  code { font-size: .8rem; word-break: break-all; }
 </style>
 </head>
 <body>
 <main>
   <h1>Sign in to your mailbox</h1>
-  <p><strong>${escapeHtml(view.clientName)}</strong> (returning to <strong>${escapeHtml(view.redirectHost)}</strong>) is asking to access your mail. It can always <strong>read</strong>; anything more only if you tick it below.</p>
+  <p><strong>${escapeHtml(view.clientName)}</strong> is asking to access your mail. Access is always <strong>read</strong>; anything more only if you tick it below.</p>
+  <p class="note">Access goes to <code>${escapeHtml(view.redirectUri)}</code>. The client name above is chosen by the client itself and not verified; only continue if you just connected this server in Claude yourself.</p>
   ${message}
   <form method="post" action="/login" autocomplete="on">
     <input type="hidden" name="pending" value="${escapeHtml(view.pendingId)}">
@@ -91,7 +94,7 @@ export function renderLoginPage(view: LoginView): string {
     <button type="submit">Allow access</button>
   </form>
   <script>${SUBMIT_ONCE_SCRIPT}</script>
-  <p class="note">Only invited addresses can sign in. You can revoke access at any time.</p>
+  <p class="note">Only invited addresses can sign in. Your mail password is stored encrypted on this server so the assistant can reach your mailbox; disconnecting the connector deletes it.</p>
 </main>
 </body>
 </html>`;

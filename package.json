@@ -1,8 +1,8 @@
 {
   "name": "poste-mcp-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Read-only MCP gateway into poste.io mailboxes. Users sign in with their own IMAP credentials over OAuth 2.1.",
+  "description": "MCP gateway into poste.io mailboxes: users sign in with their own IMAP account over OAuth 2.1; read always, organize and send opt-in.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -19,6 +19,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
     "express": "5.3.0",
+    "express-rate-limit": "8.7.1",
     "imapflow": "2.9.1",
     "mailparser": "3.12.4",
     "nodemailer": "10.2.1",

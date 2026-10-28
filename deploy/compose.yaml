@@ -18,7 +18,7 @@ services:
   gateway:
     # Built and pushed by .github/workflows/ci.yml. Pin IMAGE_TAG to a
     # sha-xxxxxxx or version tag in .env to control upgrades.
-    image: ${IMAGE_REPO:-ghcr.io/htilly/poste-mcp-gateway}:${IMAGE_TAG:-latest}
+    image: ${IMAGE_REPO:-ghcr.io/htilly/poste-mcp-gateway}:${IMAGE_TAG:?pin IMAGE_TAG in .env}
     container_name: poste-mcp-gateway
     restart: unless-stopped
     user: "1000:1000"
@@ -27,6 +27,9 @@ services:
       IMAP_HOST: ${IMAP_HOST:?set IMAP_HOST in .env}
       IMAP_PORT: "993"
       ALLOWED_USERS: ${ALLOWED_USERS:?set ALLOWED_USERS in .env}
+      SEND_USERS: ${SEND_USERS:-}
+      SEND_NEW_RECIPIENTS: ${SEND_NEW_RECIPIENTS:-draft}
+      SEND_LIMIT_PER_HOUR: ${SEND_LIMIT_PER_HOUR:-10}
       VAULT_KEY_FILE: /run/secrets/vault_key
       STATE_FILE: /state/gateway.json
     secrets:
@@ -55,7 +58,7 @@ services:
       - gateway
 
   caddy:
-    image: ${IMAGE_REPO:-ghcr.io/htilly/poste-mcp-gateway}-caddy:${IMAGE_TAG:-latest}
+    image: ${IMAGE_REPO:-ghcr.io/htilly/poste-mcp-gateway}-caddy:${IMAGE_TAG:?pin IMAGE_TAG in .env}
     container_name: poste-mcp-gateway-caddy
     restart: unless-stopped
     user: "1000:1000"

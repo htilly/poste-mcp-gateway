@@ -1,31 +1,38 @@
 # poste-mcp-gateway
 
-A read-only MCP gateway into poste.io mailboxes. A small, invited group of
-mailbox owners add `https://mail.example.com:8443/mcp` as a custom connector
-in Claude, sign in once with their own poste.io address and password, and
-Claude can then search and read **their** mailbox. It cannot send, move,
-delete or change anything.
+An MCP gateway into poste.io mailboxes. A small, invited group of mailbox
+owners add `https://mail.example.com/mcp` as a custom connector in Claude,
+sign in once with their own poste.io address and password, and Claude can
+then work with **their** mailbox. Reading is always allowed; organizing
+(flags, moves, Trash, drafts) and sending are separate permissions each
+user ticks at sign-in, and sending must also be enabled per address by the
+administrator.
 
 What it has to achieve, and why, is in [docs/requirements.md](docs/requirements.md).
 
 ## How it works
 
 ```
-Claude ──HTTPS──▶ Caddy :8443 ──▶ gateway :8080 ──IMAPS──▶ poste.io (IMAPS :993)
-                  (TLS, DNS-01)    OAuth 2.1 + MCP           EXAMINE + BODY.PEEK only
+Claude ──HTTPS :443──▶ reverse proxy ──▶ gateway :8080 ──IMAPS/SMTP──▶ poste.io
+                       (TLS)             OAuth 2.1 + MCP
 ```
 
 - **Sign-in is an IMAP login.** The OAuth authorize step shows a login page;
   the gateway checks the address against `ALLOWED_USERS` and then logs in to
   poste.io with what the user typed. Success issues an authorization code.
   There are no gateway accounts and no other way in.
+- **Permissions are scopes chosen at sign-in.** `mail.read` always;
+  `mail.modify` and `mail.send` only if ticked (send only for addresses in
+  `SEND_USERS`). Tools for scopes a grant lacks are never registered, and
+  scopes are re-checked against current configuration on every request.
 - **One grant per user and client.** The user's IMAP password is sealed with
   AES-256-GCM (key from a Docker secret, bound to the user) and stored with
   the grant. Tokens are stored hashed. Access tokens live 1 hour in memory;
-  refresh tokens rotate on every use and expire after 30 days.
-- **Every tool call opens a short IMAP session as that user,** opens the
-  folder with `EXAMINE` and fetches with `BODY.PEEK`, then logs out. Nothing
-  is mirrored or cached.
+  refresh tokens rotate on every use, slide 30 days, and grants end after
+  90 days regardless. Replaying a rotated refresh token revokes the grant.
+- **Every tool call opens a short IMAP session as that user.** Reads use
+  `EXAMINE` and `BODY.PEEK`; only the modify and send tools open a mailbox
+  read-write. Nothing is mirrored or cached.
 - **Stateless MCP over streamable HTTP:** a fresh server per request, so
   nothing is shared between users.
 
@@ -35,65 +42,100 @@ supplies the provider (`src/provider.ts`).
 
 ## Tools
 
-| Tool | Does |
-|---|---|
-| `list_folders` | Folders with message and unread counts |
-| `search_mail` | IMAP SEARCH in one folder (text, from, to, subject, since, before, unseen), newest first, max 50 |
-| `read_message` | Headers, body as text/Markdown (20k chars max), attachment list |
-| `read_thread` | Messages in the same conversation (Message-ID / In-Reply-To / References) |
-| `read_attachment` | Images as images, text formats as text (50k chars), other binaries metadata only; 5 MB max |
+| Tool | Scope | Does |
+|---|---|---|
+| `list_folders` | read | Folders with message and unread counts |
+| `search_mail` | read | IMAP SEARCH in one folder (text, from, to, subject, since, before, unseen), newest first, max 50 |
+| `read_message` | read | Headers, body as text/Markdown (20k chars max), attachment list |
+| `read_thread` | read | Messages in the same conversation (Message-ID / In-Reply-To / References) |
+| `read_attachment` | read | Images as images, text formats as text (50k chars), other binaries metadata only; 5 MB max |
+| `mark_read`, `flag_messages` | modify | Set or clear `\Seen` / `\Flagged` (max 100 messages per call) |
+| `move_messages`, `create_folder` | modify | Move to an existing folder; create a folder |
+| `trash_messages` | modify | Move to Trash. Permanent deletion does not exist |
+| `save_draft` | modify | New message, reply, reply-all or forward, saved to Drafts |
+| `send_message`, `reply_to_message`, `forward_message` | send | Send as the signed-in address via poste.io SMTP, copy kept in Sent |
 
-All are annotated read-only. Mail content is returned inside
-`<<<UNTRUSTED EMAIL CONTENT ...>>>` markers; markers inside the mail are
-neutralized so a message cannot close the block early.
+Everything a message's sender wrote (subjects, addresses, filenames, bodies,
+attachment text) is returned inside `<<<UNTRUSTED EMAIL CONTENT ...>>>`
+markers; markers inside the mail are neutralized so a message cannot close
+the block early. Images carry an explicit untrusted note.
 
 ## Security model
 
-- **Read-only is structural.** `src/` contains no mutating IMAP call and no
-  SMTP code; `test/readonly.test.ts` fails the build if one appears. Mailboxes
-  are opened with `EXAMINE`, so the server refuses changes too (verified
-  against Dovecot, which poste.io runs, in `test/live.test.ts`).
-- **Prompt injection.** Any email can contain text aimed at Claude. Since
-  nothing can be sent or changed, the worst a malicious message can do is be
-  read. Treat what Claude reports from mail with the same care as the mail.
-- **Bounded failed logins.** All IMAP logins come from the mail server's own
-  IP. Unknown addresses are refused before any IMAP traffic; real failures
-  are capped at 3 per account, 5 per client IP and 8 globally per 15 minutes,
-  after which sign-in is refused for everyone (fail closed). This guards
-  users' passwords against guessing and keeps Dovecot's per-IP login delays
-  from slowing the gateway down.
+Mail is untrusted input: any message can contain text written to steer an
+assistant. The design assumes Claude will sometimes follow such text and
+puts the limits in the server:
+
+- **Sending only to known recipients.** Mail goes out directly only to
+  addresses this mailbox has sent to before (exact match in Sent). Anything
+  else, including forwards and replies to new addresses, is saved in Drafts
+  for the user to review and send from their mail client
+  (`SEND_NEW_RECIPIENTS=draft`, the default). "Has emailed me" would not
+  help: an injected request arrives from exactly the address it wants data
+  sent to. Sending is also off unless the address is in `SEND_USERS`,
+  capped at `SEND_LIMIT_PER_HOUR` (10) and 20 recipients per message, always
+  from the signed-in address, and every send is audit-logged.
+- **Contained changes.** Mutating IMAP calls exist only in `mail-write.ts`
+  and SMTP only in `smtp.ts`; `test/readonly.test.ts` fails the build
+  otherwise, and enforces that read-only grants never see a write tool.
+  There is no expunge and no folder deletion or rename.
+- **Only Claude can be a client.** Dynamic client registration accepts
+  redirect URIs only for `ALLOWED_REDIRECT_HOSTS` (claude.ai, claude.com)
+  or loopback, so nobody can register a look-alike client that collects
+  authorization codes through the genuine sign-in page. The page still
+  shows the full redirect URI.
+- **Bounded failed logins, also under parallel requests.** All IMAP logins
+  come from one IP. Unknown addresses are refused before any IMAP traffic.
+  Each attempt is reserved before the IMAP call, an account has at most one
+  attempt in flight, and failures are capped per account+IP (3), per IP
+  (5) and globally (8) per 15 minutes; IPs with an earlier successful
+  sign-in are exempt from the global lock. Every refusal looks the same, so
+  the page reveals neither the allowlist nor lock state. `POST /login` is
+  additionally rate-limited per IP.
 - **No poste.io changes.** poste.io's IP blocking ("guard") is part of its
   SMTP server and IMAP failures don't trigger it, so the gateway needs no
   whitelist. Don't add one: a guard whitelist entry makes SMTP from that IP
   skip spam and virus checks, and does nothing for IMAP.
-- **Credentials at rest.** `state/gateway.json` holds sealed passwords and
-  token hashes only. Without `secrets/vault_key` the passwords cannot be
-  recovered; with it they can, so the key and the state file are as
-  sensitive as the passwords themselves.
-- **No secrets or mail in logs.** Logs carry addresses, IPs and status codes.
+- **Credentials at rest.** The state file holds sealed passwords and token
+  hashes only. Without the vault key the passwords cannot be recovered;
+  with it they can, so keep the key outside the deploy directory where
+  possible and treat both as sensitive as the passwords. The sign-in page
+  tells users their password is stored.
+- **Bounded work.** Messages over 25 MB are refused before download; one
+  grant may run at most 3 tool calls at once; header fields are truncated.
+- **Audit log.** One JSON line per event on stderr: sign-ins (with scopes
+  and client), refused sign-ins, client registrations, grant revocations,
+  and every send, held-as-draft, move, trash, flag and draft. Never
+  passwords, tokens or message content.
 - **A changed poste.io password** makes the next tool call fail; the gateway
-  then deletes that grant (so it stops retrying the old password against
-  poste.io) and the user reconnects.
+  then deletes that grant and the user reconnects.
 
 ## Revoking access
 
 - A user: disconnect the connector in Claude (calls the revocation endpoint).
 - An admin: remove the address from `ALLOWED_USERS` and restart; grants for
-  addresses no longer allowed are deleted at startup.
-- Everyone at once: replace `secrets/vault_key` and delete `state/`.
+  addresses no longer allowed are deleted at startup. Removing an address
+  from `SEND_USERS` takes send away on the next request.
+- Everyone at once: replace the vault key and delete the state file.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PUBLIC_URL` | required | External URL, e.g. `https://mail.example.com:8443`. OAuth issuer; the MCP endpoint is `PUBLIC_URL/mcp`. |
+| `PUBLIC_URL` | required | External URL, e.g. `https://mail.example.com`. OAuth issuer; the MCP endpoint is `PUBLIC_URL/mcp`. |
 | `ALLOWED_USERS` | required | Comma-separated mailbox addresses allowed to sign in. |
+| `SEND_USERS` | empty | Addresses that may be granted `mail.send`. Must be a subset of `ALLOWED_USERS`. Empty: nobody can send. |
+| `SEND_NEW_RECIPIENTS` | `draft` | `draft`: mail to never-before-mailed recipients is saved to Drafts instead. `allow`: send anyway. |
+| `SEND_LIMIT_PER_HOUR` | `10` | Messages per user per hour. |
+| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | https hosts OAuth clients may redirect to (subdomains included). Loopback http is always allowed. |
+| `MAX_GRANT_AGE_DAYS` | `90` | Absolute grant lifetime; refreshing never extends past it. |
 | `IMAP_HOST` | required | poste.io IMAP host. |
 | `IMAP_PORT` | `993` | IMAPS port. |
 | `IMAP_SERVERNAME` | `IMAP_HOST` | Name the IMAP certificate is checked against. |
-| `VAULT_KEY_FILE` / `VAULT_KEY` | required | 32-byte key, hex or base64. Prefer the file (a Docker secret). |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` | `IMAP_HOST` / `587` / port 465 | Submission server; STARTTLS is required unless `SMTP_SECURE=true`. |
+| `VAULT_KEY_FILE` / `VAULT_KEY` | required | 32-byte key, hex or base64. Prefer the file (a read-only mount or Docker secret): an env var shows up in `docker inspect`. |
 | `STATE_FILE` | `/state/gateway.json` | Clients and grants. |
-| `LISTEN_HOST` / `LISTEN_PORT` | `0.0.0.0` / `8080` | Inside the container network only. |
+| `LISTEN_HOST` / `LISTEN_PORT` | `0.0.0.0` / `8080` | Inside the container; publish it on loopback only. |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | `3600` / `2592000` | Seconds. |
 
 ## Deploying
@@ -131,6 +173,8 @@ server {
 }
 ```
 
+The gateway sets `Strict-Transport-Security` itself when `PUBLIC_URL` is https.
+
 ### Standalone on the mail server (`deploy/`)
 
 `deploy/` holds a compose project: the gateway plus a Caddy built with the
@@ -146,7 +190,9 @@ All site-specific values (hostnames, port, ACME email, allowed users) go in
 Images are built by GitHub Actions (`.github/workflows/ci.yml`) after the
 unit and live-IMAP tests pass, and pushed to GHCR:
 `ghcr.io/<owner>/poste-mcp-gateway` and `ghcr.io/<owner>/poste-mcp-gateway-caddy`,
-tagged `latest` (main), `sha-xxxxxxx` and the version on `v*` tags. The
+tagged `latest` (main), `sha-xxxxxxx` and the version on `v*` tags. Pin a
+version tag in production rather than `latest`, so a capability change
+never arrives on an unattended pull (see CHANGELOG.md). The
 server only needs `deploy/compose.yaml`, `deploy/caddy/Caddyfile` and the
 files below; it never builds anything.
 
@@ -164,7 +210,7 @@ docker compose pull && docker compose up -d
 docker compose logs -f
 ```
 
-Upgrade: `docker compose pull && docker compose up -d`.
+Upgrade: read CHANGELOG.md, bump the pinned tag, then `docker compose pull && docker compose up -d`.
 
 Then in Claude (via a 443 front end, see above): Settings → Connectors → Add custom connector →
 `https://<PUBLIC_HOST>:<PUBLIC_PORT>/mcp`.
@@ -173,7 +219,7 @@ Then in Claude (via a 443 front end, see above): Settings → Connectors → Add
 
 ```bash
 npm ci
-npm test          # unit, read-only guarantees, full OAuth + MCP flow (IMAP faked)
+npm test          # unit, write confinement, send policy, full OAuth + MCP flow (IMAP faked)
 npm run lint      # tsc --noEmit
 npm run build
 ```
@@ -182,7 +228,7 @@ npm run build
 
 `test/live.test.ts` runs the IMAP layer against a real server and is skipped
 by default. With Dovecot (the server poste.io uses; also checks that `EXAMINE`
-makes the server refuse writes):
+makes the server refuse writes, the write tools, and exact Sent-history matching):
 
 ```bash
 docker run -d --rm --name gw-dovecot -e USER_PASSWORD=dovecot-test -p 127.0.0.1:4993:31993 dovecot/dovecot:2.4.1

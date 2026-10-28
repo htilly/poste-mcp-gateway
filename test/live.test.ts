@@ -8,6 +8,8 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { ImapFlow } from 'imapflow';
 import { MailReader } from '../src/mail.js';
 import { verifyLogin, withMailbox, type ImapTarget } from '../src/imap.js';
+import { MailWriter } from '../src/mail-write.js';
+import { buildRaw, newDraft } from '../src/compose.js';
 
 const live = process.env.LIVE_IMAP === '1';
 const target: ImapTarget = {
@@ -114,5 +116,54 @@ describe.skipIf(!live)('live IMAP (GreenMail)', () => {
   it('keeps users apart', async () => {
     const { total } = await reader.search(bob, { folder: 'INBOX', subject: tag });
     expect(total).toBe(0);
+  });
+
+  describe('writes (mail.modify) and sent history (mail.send policy)', () => {
+    const writer = new MailWriter(target);
+    const seed = async (fn: (c: ImapFlow) => Promise<void>) => {
+      const c = new ImapFlow({ host: target.host, port: target.port, secure: true, tls: target.tls, auth: { user: alice.user, pass: alice.password }, logger: false });
+      await c.connect();
+      try {
+        await fn(c);
+      } finally {
+        await c.logout();
+      }
+    };
+
+    beforeAll(async () => {
+      await seed(async c => {
+        for (const f of ['Sent', 'Trash', 'Drafts']) await c.mailboxCreate(f).catch(() => undefined);
+        await c.append('Sent', ['From: alice@example.com', `To: anna-${tag}@example.com`, `Subject: sent ${tag}`, '', 'x'].join('\r\n'), ['\\Seen']);
+        await c.append('INBOX', ['From: x@evil.example', 'To: alice@example.com', `Subject: write-test ${tag}`, '', 'y'].join('\r\n'));
+      });
+    });
+
+    it('knows only exact addresses this mailbox has sent to', async () => {
+      const known = await reader.previouslySentTo(alice, [`anna-${tag}@example.com`, `nna-${tag}@example.com`, 'x@evil.example']);
+      expect([...known]).toEqual([`anna-${tag}@example.com`]);
+    });
+
+    it('flags, marks read, moves, trashes and saves drafts', async () => {
+      const uid = (await reader.search(alice, { folder: 'INBOX', subject: `write-test ${tag}` })).messages[0]!.uid;
+      await writer.setFlagged(alice, 'INBOX', [uid], true);
+      await writer.setSeen(alice, 'INBOX', [uid], true);
+      const after = (await reader.search(alice, { folder: 'INBOX', subject: `write-test ${tag}` })).messages[0]!;
+      expect(after).toMatchObject({ flagged: true, seen: true });
+
+      const folder = `Archive-${tag}`;
+      expect(await writer.createFolder(alice, folder)).toMatchObject({ created: true });
+      await writer.move(alice, 'INBOX', [uid], folder);
+      const moved = (await reader.search(alice, { folder, subject: `write-test ${tag}` })).messages;
+      expect(moved).toHaveLength(1);
+
+      expect(await writer.trash(alice, folder, [moved[0]!.uid])).toMatchObject({ to: 'Trash' });
+      const trashed = (await reader.search(alice, { folder: 'Trash', subject: `write-test ${tag}` })).messages;
+      expect(trashed).toHaveLength(1);
+      await expect(writer.trash(alice, 'Trash', [trashed[0]!.uid])).rejects.toThrow(/already in Trash/);
+
+      const draft = newDraft(alice.user, { to: ['someone@example.com'], subject: `draft ${tag}`, text: 'later' });
+      expect(await writer.saveDraft(alice, await buildRaw(draft))).toEqual({ folder: 'Drafts' });
+      expect((await reader.search(alice, { folder: 'Drafts', subject: `draft ${tag}` })).total).toBe(1);
+    });
   });
 });
