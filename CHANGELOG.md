@@ -3,6 +3,12 @@
 Capability changes are called out first: a new version can let an assistant
 do more with a mailbox, so read this before bumping a pinned image tag.
 
+## 0.4.3
+
+**Fix.** The sign-in page no longer claims that removing the connector
+deletes the stored password, which only holds if the app revokes its token.
+It now states when the password is deleted.
+
 ## 0.4.2
 
 **Behavior change: search.** `search_mail`'s `text` now matches subject,

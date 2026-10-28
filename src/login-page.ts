@@ -134,7 +134,7 @@ export function renderLoginPage(view: LoginView): string {
     </fieldset>
     <button type="submit">Allow access</button>
   </form>
-  <p class="note">Only invited addresses can sign in. Your mail password is stored encrypted on this server so the assistant can reach your mailbox; disconnecting the connector deletes it.</p>
+  <p class="note">Only invited addresses can sign in. Your mail password is stored encrypted on this server so the assistant can reach your mailbox. It is deleted when the connection ends: when the app revokes it, after at most 90 days, or when your address is removed. Changing your mail password also cuts off access.</p>
 </main>`);
 }
 
