@@ -56,7 +56,7 @@ supplies the provider (`src/provider.ts`).
 | `add_mailbox` | any | A one-time link (10 minutes) where the user signs in to another mailbox to add it |
 | `remove_mailbox` | any | Remove an added mailbox (not the primary) and delete its stored password |
 | `list_folders` | read | Folders with message and unread counts |
-| `search_mail` | read | IMAP SEARCH in one folder (text, from, to, subject, since, before, unseen), newest first, max 50 |
+| `search_mail` | read | Search one folder, newest first, max 50. `text`/`from`/`to`/`subject`/dates are fast; `body` searches message text and is slow without a server index (default: last 365 days) |
 | `read_message` | read | Headers, body as text/Markdown (20k chars max), attachment list |
 | `read_thread` | read | Messages in the same conversation (Message-ID / In-Reply-To / References) |
 | `read_attachment` | read | Images as images, text formats as text (50k chars), other binaries metadata only; 5 MB max |
@@ -121,12 +121,19 @@ puts the limits in the server:
   with it they can, so keep the key outside the deploy directory where
   possible and treat both as sensitive as the passwords. The sign-in page
   tells users their password is stored.
+- **Search speed.** Without a full-text index in Dovecot, body search makes
+  the server read every message in range, which takes long on mailboxes of
+  several GB. Free text (`text`) therefore matches subject, sender and
+  recipient only, which Dovecot answers from its cache; `body` is separate
+  and limited to the last year unless a date is given. Enabling Dovecot FTS
+  in the mail server would make body search fast too.
 - **Bounded work.** Messages over 25 MB are refused before download; one
   grant may run at most 3 tool calls at once; header fields are truncated.
 - **Audit log.** One JSON line per event on stderr: sign-ins (with scopes
   and client), refused sign-ins, client registrations, grant revocations,
-  and every send, held-as-draft, move, trash, flag and draft. Never
-  passwords, tokens or message content.
+  every send, held-as-draft, move, trash, flag and draft, and every tool call
+  with its duration and the names (not values) of its arguments. Never
+  passwords, tokens, search terms or message content.
 - **A changed poste.io password** makes the next tool call fail; the gateway
   then deletes that grant and the user reconnects.
 

@@ -3,6 +3,18 @@
 Capability changes are called out first: a new version can let an assistant
 do more with a mailbox, so read this before bumping a pinned image tag.
 
+## 0.4.2
+
+**Behavior change: search.** `search_mail`'s `text` now matches subject,
+sender and recipient only (IMAP OR SUBJECT/FROM/TO), which the server
+answers from its header cache. Searching message text moved to a new `body`
+argument; without a full-text index the server reads every message for it,
+so it defaults to the last 365 days unless `since` is given. Before, `text`
+used IMAP TEXT and made every search scan whole mailboxes.
+
+**New.** The audit log records each tool call's duration and the names of
+the arguments used (never values), to find what is slow.
+
 ## 0.4.1
 
 **Fix.** Sign-in could hang on "Checking with the mail server…": the page's

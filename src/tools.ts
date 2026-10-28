@@ -3,7 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { z } from 'zod';
-import { LIMITS, type MailReader } from './mail.js';
+import { BODY_SEARCH_DEFAULT_DAYS, LIMITS, defaultBodySince, type MailReader } from './mail.js';
 import type { ImapCredentials } from './imap.js';
 import type { MailWriter } from './mail-write.js';
 import type { MailSender } from './smtp.js';
@@ -70,17 +70,33 @@ const accountParam = z
  * Every mailbox tool takes an optional `account`. Rather than threading it
  * through each handler, this wraps registerTool: the parameter is added to
  * the schema, and its value is carried to the runner for the duration of
- * the call.
+ * the call. The wrapper also logs each call's duration, with the names of
+ * the arguments used but never their values.
  */
-function withAccountParam(server: McpServer): McpServer {
+function withAccountParam(server: McpServer, audit: Audit): McpServer {
   return new Proxy(server, {
     get(target, prop, receiver) {
       if (prop === 'registerTool') {
-        return (name: string, config: { inputSchema?: Record<string, unknown> }, handler: (args: { account?: string }, extra: unknown) => unknown) =>
+        return (
+          name: string,
+          config: { inputSchema?: Record<string, unknown> },
+          handler: (args: Record<string, unknown> & { account?: string }, extra: unknown) => Promise<CallToolResult>,
+        ) =>
           (target.registerTool as (...a: unknown[]) => unknown)(
             name,
             { ...config, inputSchema: { ...config.inputSchema, account: accountParam } },
-            (args: { account?: string }, extra: unknown) => selectedAccount.run(args?.account, () => handler(args, extra)),
+            async (args: Record<string, unknown> & { account?: string }, extra: unknown) => {
+              const started = Date.now();
+              const result = await selectedAccount.run(args?.account, () => handler(args, extra));
+              audit('tool_call', {
+                tool: name,
+                account: args?.account?.toLowerCase() ?? 'default',
+                ms: Date.now() - started,
+                args: Object.keys(args ?? {}).filter(k => k !== 'account' && args[k] !== undefined),
+                error: result?.isError === true,
+              });
+              return result;
+            },
           );
       }
       const value = Reflect.get(target, prop, receiver);
@@ -149,7 +165,7 @@ function withUntrusted(facts: Record<string, unknown>, data: unknown): CallToolR
  */
 export function registerTools(raw: McpServer, ctx: ToolContext): void {
   const run = makeRunner(ctx);
-  const server = withAccountParam(raw);
+  const server = withAccountParam(raw, ctx.audit ?? silentAudit);
 
   raw.registerTool(
     'list_accounts',
@@ -230,11 +246,17 @@ export function registerTools(raw: McpServer, ctx: ToolContext): void {
     {
       title: 'Search mail',
       description:
-        'Search one folder with IMAP SEARCH and return message summaries, newest first. All criteria are combined with AND. ' +
+        'Search one folder and return message summaries, newest first. All criteria are combined with AND. ' +
+        'Prefer text/from/to/subject and dates: they are fast. Use body only when the words are only in the message text: ' +
+        `it reads every message and is slow on large mailboxes (limited to the last ${BODY_SEARCH_DEFAULT_DAYS} days unless since is given). ` +
         `Returns at most ${LIMITS.searchResults} messages plus the total match count. Read a message with read_message.`,
       inputSchema: {
         folder,
-        text: z.string().optional().describe('Words that must appear anywhere in the message (headers or body).'),
+        text: z.string().optional().describe('Matches subject, sender or recipient (name or address). Fast.'),
+        body: z
+          .string()
+          .optional()
+          .describe(`Words in the message text. Slow on large mailboxes; give since/before to narrow it (default: last ${BODY_SEARCH_DEFAULT_DAYS} days).`),
         from: z.string().optional().describe('Sender address or name contains this.'),
         to: z.string().optional().describe('Recipient address or name contains this.'),
         subject: z.string().optional().describe('Subject contains this.'),
@@ -248,7 +270,9 @@ export function registerTools(raw: McpServer, ctx: ToolContext): void {
     async (args, extra) =>
       run(extra.authInfo, async creds => {
         const result = await ctx.reader.search(creds, args);
-        return withUntrusted({ folder: args.folder, total: result.total, returned: result.messages.length }, result.messages);
+        const facts: Record<string, unknown> = { folder: args.folder, total: result.total, returned: result.messages.length };
+        if (args.body && !args.since) facts.bodySearchedSince = defaultBodySince(new Date()).toISOString().slice(0, 10);
+        return withUntrusted(facts, result.messages);
       }),
   );
 

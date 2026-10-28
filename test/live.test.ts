@@ -77,6 +77,13 @@ describe.skipIf(!live)('live IMAP (GreenMail)', () => {
     expect(messages[0]!.uid).toBeGreaterThan(messages[1]!.uid);
   });
 
+  it('free text matches headers but not the body; body search matches the text', async () => {
+    expect((await reader.search(alice, { folder: 'INBOX', text: tag })).total).toBe(2);
+    expect((await reader.search(alice, { folder: 'INBOX', text: 'sender@example.com', subject: tag })).total).toBe(2);
+    expect((await reader.search(alice, { folder: 'INBOX', text: 'Hello from the test', subject: tag })).total).toBe(0);
+    expect((await reader.search(alice, { folder: 'INBOX', body: 'Hello from the test', subject: tag })).total).toBe(2);
+  });
+
   it('reads a message without marking it seen', async () => {
     const { messages } = await reader.search(alice, { folder: 'INBOX', subject: `${tag} first` });
     const uid = messages.at(-1)!.uid;

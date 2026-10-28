@@ -206,6 +206,21 @@ describe('buildSearch', () => {
     expect(s.since).toBeInstanceOf(Date);
   });
 
+  it('matches free text on headers only, which the server answers from its cache', () => {
+    expect(buildSearch({ folder: 'INBOX', text: 'bank' })).toEqual({
+      or: [{ subject: 'bank' }, { from: 'bank' }, { to: 'bank' }],
+    });
+  });
+
+  it('limits body searches to the last year unless a start date is given', () => {
+    const now = new Date('2026-10-28T00:00:00Z');
+    const s = buildSearch({ folder: 'INBOX', body: 'invoice' }, now);
+    expect(s.body).toBe('invoice');
+    expect((s.since as Date).toISOString().slice(0, 10)).toBe('2025-10-28');
+    const explicit = buildSearch({ folder: 'INBOX', body: 'invoice', since: '2020-01-01' }, now);
+    expect((explicit.since as Date).toISOString().slice(0, 10)).toBe('2020-01-01');
+  });
+
   it('rejects malformed dates', () => {
     expect(() => buildSearch({ folder: 'INBOX', since: 'last tuesday' })).toThrow(/since/);
   });

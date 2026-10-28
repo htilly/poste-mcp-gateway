@@ -55,7 +55,10 @@ export interface MessageView extends MessageSummary {
 
 export interface SearchQuery {
   folder: string;
+  /** Matches subject, sender or recipient: answered from Dovecot's header cache, fast. */
   text?: string;
+  /** Matches the message body: the server reads every message in range, slow on large mailboxes. */
+  body?: string;
   from?: string;
   to?: string;
   subject?: string;
@@ -108,19 +111,34 @@ function parseDate(value: string | undefined, field: string): Date | undefined {
   return d;
 }
 
-export function buildSearch(q: SearchQuery): SearchObject {
+/** Body searches without a start date are limited to this many days back. */
+export const BODY_SEARCH_DEFAULT_DAYS = 365;
+
+/**
+ * Translates a query into IMAP SEARCH. Without a full-text index on the
+ * server, TEXT and BODY make Dovecot open every message in the folder, which
+ * takes seconds to minutes on a mailbox of several GB; header criteria are
+ * served from its cache. So free text matches headers, and body search is a
+ * separate, explicitly slow option, bounded in time by default.
+ */
+export function buildSearch(q: SearchQuery, now = new Date()): SearchObject {
   const search: SearchObject = {};
-  if (q.text) search.text = q.text;
+  if (q.text) search.or = [{ subject: q.text }, { from: q.text }, { to: q.text }];
+  if (q.body) search.body = q.body;
   if (q.from) search.from = q.from;
   if (q.to) search.to = q.to;
   if (q.subject) search.subject = q.subject;
-  const since = parseDate(q.since, 'since');
   const before = parseDate(q.before, 'before');
+  const since = parseDate(q.since, 'since') ?? (q.body ? defaultBodySince(now) : undefined);
   if (since) search.since = since;
   if (before) search.before = before;
   if (q.unseen) search.seen = false;
   if (Object.keys(search).length === 0) search.all = true;
   return search;
+}
+
+export function defaultBodySince(now: Date): Date {
+  return new Date(now.getTime() - BODY_SEARCH_DEFAULT_DAYS * 86400_000);
 }
 
 function bodyOf(parsed: ParsedMail): string {
