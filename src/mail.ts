@@ -4,10 +4,9 @@ import { htmlToMarkdown } from './vendor/html-to-markdown.js';
 import { withClient, withMailbox, type ImapCredentials, type ImapTarget } from './imap.js';
 
 /**
- * Every read the gateway can do, and nothing else. There is deliberately no
- * write method here; imapflow's mutating calls (messageFlagsAdd, messageMove,
- * messageDelete, append, mailboxCreate, ...) are not used anywhere in src/,
- * which test/readonly.test.ts asserts.
+ * Every read the gateway can do, and nothing else. All mailboxes are opened
+ * read-only (EXAMINE). Changes live in mail-write.ts and sending in smtp.ts;
+ * test/readonly.test.ts asserts no other file calls a mutating imapflow method.
  */
 
 export const LIMITS = {
@@ -15,6 +14,7 @@ export const LIMITS = {
   bodyChars: 20_000,
   attachmentTextChars: 50_000,
   attachmentBytes: 5 * 1024 * 1024,
+  rawSourceBytes: 25 * 1024 * 1024,
 };
 
 export interface FolderInfo {
@@ -182,6 +182,18 @@ export class MailReader {
         throw new Error(`attachment is ${att.size} bytes; the limit is ${LIMITS.attachmentBytes}`);
       }
       return { filename: att.filename, contentType: att.contentType, size: att.size, content: att.content };
+    });
+  }
+
+  /** The raw RFC 5322 source of one message, for replying to or forwarding it. */
+  async getRawSource(creds: ImapCredentials, folder: string, uid: number): Promise<Buffer> {
+    return withMailbox(this.target, creds, folder, async client => {
+      const msg = await client.fetchOne(String(uid), { uid: true, size: true, source: true }, { uid: true });
+      if (!msg || !msg.source) throw new Error(`no message with UID ${uid} in ${folder}`);
+      if ((msg.size ?? msg.source.length) > LIMITS.rawSourceBytes) {
+        throw new Error(`message is ${msg.size} bytes; the limit for reply/forward is ${LIMITS.rawSourceBytes}`);
+      }
+      return msg.source;
     });
   }
 

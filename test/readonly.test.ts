@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { TOOL_NAMES, registerTools } from '../src/tools.js';
+import { READ_TOOLS, registerTools } from '../src/tools.js';
+import { MODIFY_TOOLS, SEND_TOOLS } from '../src/write-tools.js';
+import { SCOPES, type Scope } from '../src/scopes.js';
 import type { MailReader } from '../src/mail.js';
+import type { MailWriter } from '../src/mail-write.js';
+import type { MailSender } from '../src/smtp.js';
 
 const SRC = new URL('../src/', import.meta.url).pathname;
 
@@ -13,7 +17,10 @@ function sources(dir: string): string[] {
   );
 }
 
-// Every imapflow method that can change a mailbox or send anything.
+/** Source text without comments: comments may name what the code avoids. */
+const code = (file: string) => readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
+
+// Every imapflow method that can change a mailbox.
 const MUTATING = [
   'messageFlagsAdd', 'messageFlagsRemove', 'messageFlagsSet',
   'messageDelete', 'messageMove', 'messageCopy',
@@ -21,48 +28,83 @@ const MUTATING = [
   'mailboxSubscribe', 'mailboxUnsubscribe', 'setFlagColor', 'setQuota',
 ];
 
-describe('read-only by construction', () => {
-  it('no source file calls a mutating imapflow method', () => {
-    const offenders = sources(SRC).flatMap(file => {
-      const text = readFileSync(file, 'utf8');
-      return MUTATING.filter(m => new RegExp(`\\.${m}\\s*\\(`).test(text)).map(m => `${file}: ${m}`);
-    });
+describe('writes are confined', () => {
+  it('only mail-write.ts calls mutating imapflow methods', () => {
+    const offenders = sources(SRC)
+      .filter(f => basename(f) !== 'mail-write.ts')
+      .flatMap(f => MUTATING.filter(m => new RegExp(`\\.${m}\\s*\\(`).test(code(f))).map(m => `${basename(f)}: ${m}`));
     expect(offenders).toEqual([]);
   });
 
-  it('no source file can send mail', () => {
-    // Code only: comments may mention SMTP when explaining why it is absent.
-    const code = (f: string) => readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
-    const offenders = sources(SRC).filter(f => /nodemailer|smtp/i.test(code(f)));
-    expect(offenders).toEqual([]);
-  });
-
-  it('every mailbox is opened read-only', () => {
-    const imap = readFileSync(join(SRC, 'imap.ts'), 'utf8');
-    const locks = imap.match(/getMailboxLock\([^)]*\)/g) ?? [];
-    expect(locks.length).toBeGreaterThan(0);
-    for (const call of locks) expect(call).toContain('readOnly: true');
-    for (const file of sources(SRC)) {
-      if (file.endsWith('imap.ts')) continue;
-      expect(readFileSync(file, 'utf8')).not.toMatch(/getMailboxLock|mailboxOpen/);
+  it('mail-write.ts never expunges or deletes folders', () => {
+    const text = code(join(SRC, 'mail-write.ts'));
+    for (const m of ['messageDelete', 'mailboxDelete', 'mailboxRename', 'expunge']) {
+      expect(text).not.toMatch(new RegExp(`\\.${m}\\s*\\(`));
     }
   });
 
-  it('registers exactly the read tools, all annotated read-only', () => {
-    const registered: { name: string; annotations?: Record<string, unknown> }[] = [];
-    const fake = {
-      registerTool: (name: string, config: { annotations?: Record<string, unknown> }) => {
-        registered.push({ name, annotations: config.annotations });
-      },
-    } as unknown as McpServer;
-    registerTools(fake, {
-      reader: {} as MailReader,
-      credentialsFor: () => ({ grantId: 'g', creds: { user: 'u', password: 'p' } }),
-      revokeGrant: () => {},
-    });
-    expect(registered.map(r => r.name).sort()).toEqual([...TOOL_NAMES].sort());
-    for (const r of registered) {
-      expect(r.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+  it('only smtp.ts can send mail', () => {
+    const offenders = sources(SRC)
+      .filter(f => basename(f) !== 'smtp.ts')
+      .filter(f => /from 'nodemailer'|createTransport|sendMail/.test(code(f)));
+    expect(offenders).toEqual([]);
+  });
+
+  it('mailboxes open read-only unless mail-write.ts asks otherwise', () => {
+    const imap = code(join(SRC, 'imap.ts'));
+    expect(imap).toMatch(/writable = false/);
+    expect(imap).toMatch(/getMailboxLock\(mailbox, \{ readOnly: !writable \}\)/);
+    const writers = sources(SRC).filter(f => /writable: true/.test(code(f))).map(f => basename(f));
+    expect(writers).toEqual(['mail-write.ts']);
+    for (const file of sources(SRC)) {
+      if (basename(file) === 'imap.ts') continue;
+      expect(code(file)).not.toMatch(/getMailboxLock|mailboxOpen/);
+    }
+  });
+});
+
+function registered(scopes: Scope[]) {
+  const tools: { name: string; annotations?: Record<string, unknown> }[] = [];
+  const fake = {
+    registerTool: (name: string, config: { annotations?: Record<string, unknown> }) => {
+      tools.push({ name, annotations: config.annotations });
+    },
+  } as unknown as McpServer;
+  registerTools(fake, {
+    reader: {} as MailReader,
+    writer: {} as MailWriter,
+    sender: {} as MailSender,
+    scopes,
+    credentialsFor: () => ({ grantId: 'g', creds: { user: 'u', password: 'p' } }),
+    revokeGrant: () => {},
+  });
+  return tools;
+}
+
+describe('tools follow the grant\'s scopes', () => {
+  it('read only: exactly the read tools, all annotated read-only', () => {
+    const tools = registered([SCOPES.read]);
+    expect(tools.map(t => t.name).sort()).toEqual([...READ_TOOLS].sort());
+    for (const t of tools) expect(t.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+  });
+
+  it('modify adds the modify tools and nothing that sends', () => {
+    const names = registered([SCOPES.read, SCOPES.modify]).map(t => t.name).sort();
+    expect(names).toEqual([...READ_TOOLS, ...MODIFY_TOOLS].sort());
+  });
+
+  it('send adds the send tools, marked destructive and open-world', () => {
+    const tools = registered([SCOPES.read, SCOPES.send]);
+    expect(tools.map(t => t.name).sort()).toEqual([...READ_TOOLS, ...SEND_TOOLS].sort());
+    for (const t of tools.filter(t => (SEND_TOOLS as readonly string[]).includes(t.name))) {
+      expect(t.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true });
+    }
+  });
+
+  it('every non-read tool says it is not read-only', () => {
+    const tools = registered([SCOPES.read, SCOPES.modify, SCOPES.send]);
+    for (const t of tools.filter(t => !(READ_TOOLS as readonly string[]).includes(t.name))) {
+      expect(t.annotations?.readOnlyHint).toBe(false);
     }
   });
 });

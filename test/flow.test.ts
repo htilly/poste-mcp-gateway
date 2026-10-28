@@ -11,6 +11,9 @@ import { GatewayProvider } from '../src/provider.js';
 import { createApp } from '../src/server.js';
 import type { ImapCredentials, LoginResult } from '../src/imap.js';
 import type { MailReader } from '../src/mail.js';
+import type { MailWriter } from '../src/mail-write.js';
+import type { MailSender } from '../src/smtp.js';
+import type { Draft } from '../src/compose.js';
 
 const PASSWORDS: Record<string, string> = { 'alice@example.com': 'alice-pw', 'bob@example.com': 'bob-pw' };
 const REDIRECT = 'http://127.0.0.1:9/callback';
@@ -21,6 +24,21 @@ let stateFile: string;
 let loginCalls: string[];
 let readerCalls: ImapCredentials[];
 let failAuthFor: string | undefined;
+let sent: { creds: ImapCredentials; draft: Draft }[];
+let flagged: { user: string; uids: number[] }[];
+
+const fakeWriter = {
+  async setFlagged(creds: ImapCredentials, _folder: string, uids: number[]) {
+    flagged.push({ user: creds.user, uids });
+  },
+} as unknown as MailWriter;
+
+const fakeSender = {
+  async send(creds: ImapCredentials, draft: Draft) {
+    sent.push({ creds, draft });
+    return { accepted: draft.to, rejected: [], savedTo: 'Sent' };
+  },
+} as unknown as MailSender;
 
 const fakeReader = {
   async search(creds: ImapCredentials) {
@@ -47,10 +65,12 @@ beforeAll(async () => {
       loginCalls.push(user);
       return PASSWORDS[user] === password ? 'ok' : 'bad_credentials';
     },
+    // Alice may send; Bob may only read and modify.
+    canSend: user => user === 'alice@example.com',
     accessTokenTtlSec: 3600,
     refreshTokenTtlSec: 86400,
   });
-  server.on('request', createApp({ provider, reader: fakeReader, publicUrl, resourceUrl, version: 'test' }));
+  server.on('request', createApp({ provider, reader: fakeReader, writer: fakeWriter, sender: fakeSender, publicUrl, resourceUrl, version: 'test' }));
 });
 
 afterAll(() => new Promise<void>(r => server.close(() => r())));
@@ -58,6 +78,8 @@ afterAll(() => new Promise<void>(r => server.close(() => r())));
 beforeEach(() => {
   loginCalls = [];
   readerCalls = [];
+  sent = [];
+  flagged = [];
   failAuthFor = undefined;
 });
 
@@ -94,12 +116,14 @@ async function startAuthorize(clientId: string) {
   return { verifier, pending: pending! };
 }
 
-function login(pending: string, user: string, password: string) {
+function login(pending: string, user: string, password: string, scopes: string[] = []) {
+  const body = new URLSearchParams({ pending, user, password });
+  for (const scope of scopes) body.append('scope', scope);
   return fetch(`${base}/login`, {
     method: 'POST',
     redirect: 'manual',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ pending, user, password }).toString(),
+    body: body.toString(),
   });
 }
 
@@ -112,10 +136,10 @@ async function token(params: Record<string, string>) {
   return { status: res.status, body: (await res.json()) as Record<string, string> };
 }
 
-async function signIn(user: string) {
+async function signIn(user: string, scopes: string[] = []) {
   const clientId = await register();
   const { verifier, pending } = await startAuthorize(clientId);
-  const res = await login(pending, user, PASSWORDS[user]!);
+  const res = await login(pending, user, PASSWORDS[user]!, scopes);
   expect(res.status).toBe(302);
   const location = new URL(res.headers.get('location')!);
   expect(location.origin + location.pathname).toBe(REDIRECT);
@@ -252,6 +276,54 @@ describe('OAuth + MCP flow', () => {
     const res = await fetch(url, { redirect: 'manual' });
     expect(res.headers.get('content-security-policy')).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]+'/);
     expect(await res.text()).toContain('<script>');
+  });
+
+  it('grants only read unless boxes are ticked', async () => {
+    const alice = await signIn('alice@example.com');
+    expect(alice.scope).toBe('mail.read');
+    const list = await mcp(alice.access_token, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    expect(list.message.result.tools.map((t: { name: string }) => t.name)).not.toContain('send_message');
+  });
+
+  it('grants modify and send when ticked, and the tools appear and act as that user', async () => {
+    const alice = await signIn('alice@example.com', ['mail.modify', 'mail.send']);
+    expect(alice.scope!.split(' ').sort()).toEqual(['mail.modify', 'mail.read', 'mail.send']);
+    const names = (await mcp(alice.access_token, { jsonrpc: '2.0', id: 1, method: 'tools/list' })).message.result.tools.map(
+      (t: { name: string }) => t.name,
+    );
+    expect(names).toEqual(expect.arrayContaining(['flag_messages', 'trash_messages', 'save_draft', 'send_message', 'reply_to_message']));
+
+    const flag = await mcp(alice.access_token, {
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'flag_messages', arguments: { folder: 'INBOX', uids: [7, 8] } },
+    });
+    expect(flag.message.result.isError).toBeFalsy();
+    expect(flagged).toEqual([{ user: 'alice@example.com', uids: [7, 8] }]);
+
+    const send = await mcp(alice.access_token, {
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'send_message', arguments: { to: ['Carol@Example.com'], subject: 'Hi', body: 'Hello' } },
+    });
+    expect(send.message.result.isError).toBeFalsy();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.draft).toMatchObject({ from: 'alice@example.com', to: ['carol@example.com'], subject: 'Hi' });
+    expect(sent[0]!.creds.user).toBe('alice@example.com');
+  });
+
+  it('never grants send to an address that may not send, even if ticked', async () => {
+    const bob = await signIn('bob@example.com', ['mail.modify', 'mail.send']);
+    expect(bob.scope!.split(' ').sort()).toEqual(['mail.modify', 'mail.read']);
+    const call = await mcp(bob.access_token, {
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'send_message', arguments: { to: ['x@example.com'], subject: 's', body: 'b' } },
+    });
+    expect(call.message.error ?? call.message.result?.isError).toBeTruthy();
+    expect(sent).toEqual([]);
+  });
+
+  it('ignores unknown scope values from the form', async () => {
+    const alice = await signIn('alice@example.com', ['mail.admin', 'openid']);
+    expect(alice.scope).toBe('mail.read');
   });
 
   it('refuses a wrong password with the same message', async () => {

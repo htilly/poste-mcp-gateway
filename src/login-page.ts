@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto';
+import { SCOPES, type Scope } from './scopes.js';
 
 export interface LoginView {
   pendingId: string;
   clientName: string;
   redirectHost: string;
   message?: string;
+  /** Scopes ticked on a previous attempt, so a retry keeps the choice. */
+  requested?: Scope[];
 }
 
 const escapeHtml = (s: string) =>
@@ -39,6 +42,7 @@ export const LOGIN_PAGE_CSP = [
  */
 export function renderLoginPage(view: LoginView): string {
   const message = view.message ? `<p class="error" role="alert">${escapeHtml(view.message)}</p>` : '';
+  const checked = (scope: Scope) => (view.requested?.includes(scope) ? ' checked' : '');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -57,6 +61,11 @@ export function renderLoginPage(view: LoginView): string {
   input { box-sizing: border-box; width: 100%; padding: .6rem .7rem; font: inherit; border: 1px solid #8886; border-radius: 8px; background: transparent; color: inherit; }
   button { margin-top: 1.25rem; width: 100%; padding: .7rem; font: inherit; font-weight: 600; border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; }
   button:disabled { opacity: .6; cursor: progress; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin: 1rem 0 0; padding: .5rem .8rem .7rem; }
+  legend { font-weight: 600; padding: 0 .3rem; }
+  .opt { display: flex; gap: .6rem; align-items: flex-start; margin: .5rem 0 0; font-weight: 400; }
+  .opt input { width: auto; margin-top: .3rem; }
+  .opt small { display: block; color: var(--muted); }
   .error { color: var(--err); }
   .note { font-size: .85rem; }
 </style>
@@ -64,7 +73,7 @@ export function renderLoginPage(view: LoginView): string {
 <body>
 <main>
   <h1>Sign in to your mailbox</h1>
-  <p><strong>${escapeHtml(view.clientName)}</strong> (returning to <strong>${escapeHtml(view.redirectHost)}</strong>) is asking to <strong>read</strong> your mail. It will not be able to send, move, delete or change anything.</p>
+  <p><strong>${escapeHtml(view.clientName)}</strong> (returning to <strong>${escapeHtml(view.redirectHost)}</strong>) is asking to access your mail. It can always <strong>read</strong>; anything more only if you tick it below.</p>
   ${message}
   <form method="post" action="/login" autocomplete="on">
     <input type="hidden" name="pending" value="${escapeHtml(view.pendingId)}">
@@ -72,7 +81,14 @@ export function renderLoginPage(view: LoginView): string {
     <input id="user" name="user" type="email" autocomplete="username" required autofocus>
     <label for="password">Mail password</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required>
-    <button type="submit">Allow read access</button>
+    <fieldset>
+      <legend>Also allow</legend>
+      <label class="opt"><input type="checkbox" name="scope" value="${SCOPES.modify}"${checked(SCOPES.modify)}>
+        <span>Organize, delete and drafts<small>Mark read/unread, flag, move, create folders, move to Trash, save drafts.</small></span></label>
+      <label class="opt"><input type="checkbox" name="scope" value="${SCOPES.send}"${checked(SCOPES.send)}>
+        <span>Send mail as you<small>Send, reply and forward. Only for addresses the administrator allows to send.</small></span></label>
+    </fieldset>
+    <button type="submit">Allow access</button>
   </form>
   <script>${SUBMIT_ONCE_SCRIPT}</script>
   <p class="note">Only invited addresses can sign in. You can revoke access at any time.</p>

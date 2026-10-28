@@ -3,13 +3,18 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
-import { GatewayProvider, SCOPE } from './provider.js';
+import { GatewayProvider } from './provider.js';
 import { registerTools } from './tools.js';
 import type { MailReader } from './mail.js';
+import type { MailWriter } from './mail-write.js';
+import type { MailSender } from './smtp.js';
+import { ALL_SCOPES, SCOPES, isScope, type Scope } from './scopes.js';
 
 export interface AppDeps {
   provider: GatewayProvider;
   reader: MailReader;
+  writer?: MailWriter;
+  sender?: MailSender;
   /** Issuer, e.g. https://mail.example.com:8443 */
   publicUrl: URL;
   /** The MCP endpoint, publicUrl + /mcp */
@@ -17,10 +22,10 @@ export interface AppDeps {
   version: string;
 }
 
-export function createApp({ provider, reader, publicUrl, resourceUrl, version }: AppDeps): Express {
+export function createApp({ provider, reader, writer, sender, publicUrl, resourceUrl, version }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
-  // Exactly one proxy (Caddy) sits in front; req.ip is then the real client,
+  // Exactly one reverse proxy sits in front; req.ip is then the real client,
   // which the login guard and the SDK's rate limiters key on.
   app.set('trust proxy', 1);
 
@@ -33,8 +38,8 @@ export function createApp({ provider, reader, publicUrl, resourceUrl, version }:
       provider,
       issuerUrl: publicUrl,
       resourceServerUrl: resourceUrl,
-      scopesSupported: [SCOPE],
-      resourceName: 'Mail (read-only)',
+      scopesSupported: [...ALL_SCOPES],
+      resourceName: 'Mail',
     }),
   );
 
@@ -42,7 +47,8 @@ export function createApp({ provider, reader, publicUrl, resourceUrl, version }:
     const pending = String(req.body?.pending ?? '');
     const user = String(req.body?.user ?? '');
     const password = String(req.body?.password ?? '');
-    const outcome = await provider.completeLogin(pending, user, password, req.ip ?? 'unknown');
+    const requested: Scope[] = [req.body?.scope ?? []].flat().map(String).filter(isScope);
+    const outcome = await provider.completeLogin(pending, user, password, req.ip ?? 'unknown', requested);
     switch (outcome.kind) {
       case 'redirect':
         res.set('Cache-Control', 'no-store').redirect(302, outcome.location);
@@ -59,7 +65,7 @@ export function createApp({ provider, reader, publicUrl, resourceUrl, version }:
 
   const bearer = requireBearerAuth({
     verifier: provider,
-    requiredScopes: [SCOPE],
+    requiredScopes: [SCOPES.read],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceUrl),
   });
 
@@ -69,6 +75,9 @@ export function createApp({ provider, reader, publicUrl, resourceUrl, version }:
     const server = new McpServer({ name: 'poste-mcp-gateway', version });
     registerTools(server, {
       reader,
+      writer,
+      sender,
+      scopes: (req.auth?.scopes ?? []).filter(isScope),
       credentialsFor: auth => provider.credentialsFor(auth),
       revokeGrant: id => provider.revokeGrant(id),
     });

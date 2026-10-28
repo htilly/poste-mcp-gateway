@@ -17,6 +17,13 @@ export interface Config {
   /** 32-byte key sealing stored IMAP passwords. */
   vaultKey: Buffer;
   stateFile: string;
+  smtpHost: string;
+  smtpPort: number;
+  /** Implicit TLS (port 465). Otherwise STARTTLS is required. */
+  smtpSecure: boolean;
+  /** Addresses that may be granted mail.send. Defaults to every allowed user. */
+  sendUsers: Set<string>;
+  sendLimitPerHour: number;
   accessTokenTtlSec: number;
   refreshTokenTtlSec: number;
 }
@@ -50,6 +57,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const publicUrl = new URL(required(env, 'PUBLIC_URL'));
   const imapHost = required(env, 'IMAP_HOST');
+  const allowedUsers = parseAllowedUsers(required(env, 'ALLOWED_USERS'));
+  const sendUsers = env.SEND_USERS?.trim() ? parseAllowedUsers(env.SEND_USERS) : new Set(allowedUsers);
+  for (const user of sendUsers) {
+    if (!allowedUsers.has(user)) throw new Error(`SEND_USERS lists ${user}, which is not in ALLOWED_USERS`);
+  }
+  const smtpPort = Number(env.SMTP_PORT ?? 587);
 
   return {
     publicUrl,
@@ -58,9 +71,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     imapHost,
     imapPort: Number(env.IMAP_PORT ?? 993),
     imapServername: env.IMAP_SERVERNAME?.trim() || imapHost,
-    allowedUsers: parseAllowedUsers(required(env, 'ALLOWED_USERS')),
+    allowedUsers,
     vaultKey,
     stateFile: env.STATE_FILE?.trim() || '/state/gateway.json',
+    smtpHost: env.SMTP_HOST?.trim() || imapHost,
+    smtpPort,
+    smtpSecure: env.SMTP_SECURE ? env.SMTP_SECURE === 'true' : smtpPort === 465,
+    sendUsers,
+    sendLimitPerHour: Number(env.SEND_LIMIT_PER_HOUR ?? 20),
     accessTokenTtlSec: Number(env.ACCESS_TOKEN_TTL ?? 3600),
     refreshTokenTtlSec: Number(env.REFRESH_TOKEN_TTL ?? 30 * 24 * 3600),
   };

@@ -54,19 +54,23 @@ export async function verifyLogin(target: ImapTarget, creds: ImapCredentials): P
 }
 
 /**
- * Runs `fn` against one mailbox opened read-only (IMAP EXAMINE). The server
- * itself refuses flag changes and expunges in this mode, so read-only does not
- * depend on this gateway's code alone. All fetches use BODY.PEEK (imapflow's
- * default), so reading never sets \Seen either.
+ * Runs `fn` against one mailbox. By default it is opened read-only (IMAP
+ * EXAMINE): the server itself refuses flag changes and expunges, so reading
+ * does not depend on this gateway's code alone. All fetches use BODY.PEEK
+ * (imapflow's default), so reading never sets \Seen either.
+ *
+ * `writable` (IMAP SELECT) is for mail-write.ts only, which test/readonly.test.ts
+ * enforces; its tools exist only for grants with the mail.modify or mail.send scope.
  */
 export async function withMailbox<T>(
   target: ImapTarget,
   creds: ImapCredentials,
   mailbox: string,
   fn: (client: ImapFlow) => Promise<T>,
+  { writable = false }: { writable?: boolean } = {},
 ): Promise<T> {
   return withClient(target, creds, async client => {
-    const lock = await client.getMailboxLock(mailbox, { readOnly: true });
+    const lock = await client.getMailboxLock(mailbox, { readOnly: !writable });
     try {
       return await fn(client);
     } finally {

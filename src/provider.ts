@@ -19,8 +19,7 @@ import type { Grant, Store } from './store.js';
 import { LoginGuard } from './login-guard.js';
 import type { ImapCredentials, LoginResult } from './imap.js';
 import { LOGIN_PAGE_CSP, renderLoginPage } from './login-page.js';
-
-export const SCOPE = 'mail.read';
+import { SCOPES, type Scope } from './scopes.js';
 
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
@@ -37,6 +36,7 @@ interface AuthCode {
   clientId: string;
   user: string;
   sealedPassword: string;
+  scopes: Scope[];
   params: AuthorizationParams;
   expiresAt: number;
 }
@@ -63,6 +63,8 @@ export interface ProviderOptions {
   /** The MCP endpoint URL; the only acceptable RFC 8707 resource. */
   resourceUrl: URL;
   verifyLogin: (creds: ImapCredentials) => Promise<LoginResult>;
+  /** Whether this (normalized) address may be granted mail.send. */
+  canSend: (user: string) => boolean;
   accessTokenTtlSec: number;
   refreshTokenTtlSec: number;
   now?: () => number;
@@ -70,7 +72,16 @@ export interface ProviderOptions {
 
 export type LoginOutcome =
   | { kind: 'redirect'; location: string }
-  | { kind: 'retry'; status: number; message: string; pendingId: string; client: OAuthClientInformationFull; params: AuthorizationParams }
+  | {
+      kind: 'retry';
+      status: number;
+      message: string;
+      pendingId: string;
+      client: OAuthClientInformationFull;
+      params: AuthorizationParams;
+      /** Re-check the boxes the user had ticked. */
+      requested: Scope[];
+    }
   | { kind: 'expired' };
 
 /** The vault AAD for a user's password: a ciphertext only opens for the user it was sealed for. */
@@ -131,7 +142,13 @@ export class GatewayProvider implements OAuthServerProvider {
    * traffic, and its verdict for unknown addresses is indistinguishable from
    * a wrong password.
    */
-  async completeLogin(pendingId: string, user: string, password: string, ip: string): Promise<LoginOutcome> {
+  async completeLogin(
+    pendingId: string,
+    user: string,
+    password: string,
+    ip: string,
+    requested: Scope[] = [],
+  ): Promise<LoginOutcome> {
     // A second submit of a form that already signed in (double click, Enter
     // plus click) gets the same redirect instead of "expired": the browser
     // usually abandoned the first response, and with it the code.
@@ -151,7 +168,7 @@ export class GatewayProvider implements OAuthServerProvider {
       return { kind: 'expired' };
     }
     const retry = (status: number, message: string): LoginOutcome => ({
-      kind: 'retry', status, message, pendingId, client, params: pending.params,
+      kind: 'retry', status, message, pendingId, client, params: pending.params, requested,
     });
 
     const account = LoginGuard.normalize(user);
@@ -167,12 +184,19 @@ export class GatewayProvider implements OAuthServerProvider {
     this.opts.guard.record(account, ip, result === 'ok');
     if (result !== 'ok') return retry(401, 'Wrong address or password.');
 
+    // Read is always granted; modify and send only when ticked, and send only
+    // for addresses allowed to send. Anything else in the form is ignored.
+    const scopes: Scope[] = [SCOPES.read];
+    if (requested.includes(SCOPES.modify)) scopes.push(SCOPES.modify);
+    if (requested.includes(SCOPES.send) && this.opts.canSend(account)) scopes.push(SCOPES.send);
+
     this.pending.delete(pendingId);
     const code = newToken();
     this.codes.set(hashToken(code), {
       clientId: client.client_id,
       user: account,
       sealedPassword: this.opts.vault.seal(password, passwordAad(account)),
+      scopes,
       params: pending.params,
       expiresAt: this.now() + CODE_TTL_MS,
     });
@@ -225,7 +249,7 @@ export class GatewayProvider implements OAuthServerProvider {
       user: entry.user,
       clientId: client.client_id,
       sealedPassword: entry.sealedPassword,
-      scopes: [SCOPE],
+      scopes: entry.scopes,
       resource: grantResource,
       refreshHash: hashToken(refreshToken),
       refreshExpiresAt: now + this.opts.refreshTokenTtlSec * 1000,
@@ -336,7 +360,13 @@ export class GatewayProvider implements OAuthServerProvider {
 function sendLoginPage(
   res: Response,
   status: number,
-  view: { pendingId: string; client: OAuthClientInformationFull; params: AuthorizationParams; message?: string },
+  view: {
+    pendingId: string;
+    client: OAuthClientInformationFull;
+    params: AuthorizationParams;
+    message?: string;
+    requested?: Scope[];
+  },
 ): void {
   res
     .status(status)
@@ -353,6 +383,7 @@ function sendLoginPage(
         clientName: view.client.client_name ?? 'An MCP client',
         redirectHost: new URL(view.params.redirectUri).host,
         message: view.message,
+        requested: view.requested ?? [],
       }),
     );
 }

@@ -5,6 +5,8 @@ import { Store } from './store.js';
 import { LoginGuard } from './login-guard.js';
 import { GatewayProvider } from './provider.js';
 import { MailReader } from './mail.js';
+import { MailWriter } from './mail-write.js';
+import { MailSender } from './smtp.js';
 import { verifyLogin, type ImapTarget } from './imap.js';
 import { createApp } from './server.js';
 
@@ -21,11 +23,18 @@ const provider = new GatewayProvider({
   guard: new LoginGuard(config.allowedUsers),
   resourceUrl,
   verifyLogin: creds => verifyLogin(target, creds),
+  canSend: user => config.sendUsers.has(user),
   accessTokenTtlSec: config.accessTokenTtlSec,
   refreshTokenTtlSec: config.refreshTokenTtlSec,
 });
 
-const app = createApp({ provider, reader: new MailReader(target), publicUrl: config.publicUrl, resourceUrl, version });
+const writer = new MailWriter(target);
+const sender = new MailSender(
+  { host: config.smtpHost, port: config.smtpPort, secure: config.smtpSecure, servername: config.smtpHost },
+  writer,
+  config.sendLimitPerHour,
+);
+const app = createApp({ provider, reader: new MailReader(target), writer, sender, publicUrl: config.publicUrl, resourceUrl, version });
 
 store.pruneExpiredGrants();
 // Removing an address from ALLOWED_USERS and restarting is how access is revoked.
