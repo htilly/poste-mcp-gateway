@@ -177,15 +177,18 @@ with its callback on `chatgpt.com`. On the server, allow it first:
 ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,chatgpt.com
 ```
 
-Then in ChatGPT (custom connectors need Developer Mode, which OpenAI limits
-to some plans, and the menu names change between releases):
+Then on **chatgpt.com in a browser**. Developer mode and custom connectors
+are set up on the web only, not in the mobile apps; OpenAI limits them to
+some plans (Plus/Pro may be restricted to read-only tools), and the menu
+names change between releases:
 
-1. Settings → Apps & Connectors → Advanced settings → turn on **Developer
-   mode**.
-2. Back in Apps & Connectors, **Create** a connector: any name, MCP server
-   URL `https://<host>/mcp`, authentication **OAuth**.
+1. Turn on **Developer mode**: personal accounts under Settings → Security
+   and login; workspaces under Settings → Apps → Advanced settings.
+2. Add the connector under Apps (or Plugins) with **+**: any name, MCP
+   server URL `https://<host>/mcp`, authentication **OAuth**.
 3. ChatGPT registers itself and opens the gateway's sign-in page; sign in
    as for Claude.
+4. In a chat, pick it via **+** → Developer mode.
 
 The sign-in page shows where access goes (`https://chatgpt.com/...`); if it
 shows any other host, stop.
